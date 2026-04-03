@@ -1,0 +1,47 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Company {
+  id        Int      @id @default(autoincrement())
+  name      String
+  code      String   @unique
+  email     String?
+  mobile    String?
+  createdAt DateTime @default(now())
+
+  machines  Machine[]
+}
+
+model Machine {
+  id           Int      @id @default(autoincrement())
+  companyId    Int
+  machineCode  String
+  serialNumber String?  @unique
+  model        String
+  machineType  String
+  location     String?
+  status       String   @default("ACTIVE")
+  createdAt    DateTime @default(now())
+
+  company      Company  @relation(fields: [companyId], references: [id])
+  telemetry    Telemetry[]
+}
+
+model Telemetry {
+  id            Int      @id @default(autoincrement())
+  machineId     Int
+  timestamp     DateTime
+  inputVoltage  Float?
+  outputVoltage Float?
+  outputCurrent Float?
+  temperature   Float?
+  arcOn         Boolean?
+  createdAt     DateTime @default(now())
+
+  machine       Machine  @relation(fields: [machineId], references: [id])
+}
