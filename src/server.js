@@ -8,7 +8,9 @@ const app = express();
 
 // Core services
 require("./db");
-require("./mqttClient");
+if (process.env.ENABLE_MQTT === "true") {
+  require("./mqttClient");
+}
 
 // Routes
 const apiRoutes = require("./routes/api");
