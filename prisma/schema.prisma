@@ -7,28 +7,26 @@ datasource db {
 }
 
 model Company {
-  id        Int      @id @default(autoincrement())
+  id        Int       @id @default(autoincrement())
   name      String
-  code      String   @unique
+  code      String    @unique
   email     String?
   mobile    String?
-  createdAt DateTime @default(now())
-
+  createdAt DateTime  @default(now())
   machines  Machine[]
 }
 
 model Machine {
-  id           Int      @id @default(autoincrement())
+  id           Int         @id @default(autoincrement())
   companyId    Int
   machineCode  String
-  serialNumber String?  @unique
   model        String
   machineType  String
   location     String?
-  status       String   @default("ACTIVE")
-  createdAt    DateTime @default(now())
-
-  company      Company  @relation(fields: [companyId], references: [id])
+  status       String      @default("ACTIVE")
+  createdAt    DateTime    @default(now())
+  serialNumber String?     @unique
+  company      Company     @relation(fields: [companyId], references: [id])
   telemetry    Telemetry[]
 }
 
@@ -42,6 +40,5 @@ model Telemetry {
   temperature   Float?
   arcOn         Boolean?
   createdAt     DateTime @default(now())
-
   machine       Machine  @relation(fields: [machineId], references: [id])
 }
