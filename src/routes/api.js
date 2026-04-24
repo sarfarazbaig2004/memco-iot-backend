@@ -5,6 +5,8 @@ const prisma = require("../db");
 const router = express.Router();
 
 const TELEMETRY_FRESHNESS_SECONDS = 60;
+const DEFAULT_CURRENT_SETTING = 0;
+const machineControlState = new Map();
 
 function parseMachineId(rawId) {
   const machineId = Number.parseInt(rawId, 10);
@@ -180,6 +182,8 @@ function getHealthLabel(health) {
 }
 
 function buildEmptyOverview(machine) {
+  const controls = getMachineControls(machine.id);
+
   return {
     machineId: machine.id,
     machineCode: machine.machineCode,
@@ -196,7 +200,7 @@ function buildEmptyOverview(machine) {
     temperature: 0,
     weldingCurrent: 0,
     weldingVoltage: 0,
-    currentSetting: 400,
+    currentSetting: controls.currentSetting,
     fanSpeed: 0,
     inputVoltage: {
       R: 0,
@@ -211,6 +215,42 @@ function buildEmptyOverview(machine) {
     alarms: [],
     warnings: [],
     trend: [],
+  };
+}
+
+function getMachineControls(machineId) {
+  return (
+    machineControlState.get(machineId) || {
+      currentSetting: DEFAULT_CURRENT_SETTING,
+    }
+  );
+}
+
+function setMachineControls(machineId, controls) {
+  const nextControls = {
+    ...getMachineControls(machineId),
+    ...controls,
+  };
+
+  machineControlState.set(machineId, nextControls);
+  return nextControls;
+}
+
+function resetMachineControls(machineId) {
+  return setMachineControls(machineId, {
+    currentSetting: DEFAULT_CURRENT_SETTING,
+  });
+}
+
+function buildZeroTelemetryData(machineId) {
+  return {
+    machineId,
+    timestamp: new Date(),
+    inputVoltage: 0,
+    outputVoltage: 0,
+    outputCurrent: 0,
+    temperature: 0,
+    arcOn: false,
   };
 }
 
@@ -461,6 +501,138 @@ router.post("/telemetry", async (req, res) => {
   }
 });
 
+router.post("/machine/:id/set-current", async (req, res) => {
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
+
+    if (!machineIdentifier) {
+      return res.status(400).json({
+        error: "Machine identifier is required",
+      });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: { id: true, machineCode: true },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
+      });
+    }
+
+    const rawCurrentSetting =
+      req.body.currentSetting ?? req.body.current ?? req.body.value ?? 0;
+    const parsedCurrentSetting = parseOptionalNumber(rawCurrentSetting);
+
+    if (
+      parsedCurrentSetting === null ||
+      Number.isNaN(parsedCurrentSetting) ||
+      parsedCurrentSetting < 0
+    ) {
+      return res.status(400).json({
+        error: "currentSetting must be a valid non-negative number",
+      });
+    }
+
+    const controls = setMachineControls(machine.id, {
+      currentSetting: parsedCurrentSetting,
+    });
+
+    return res.json({
+      message: "Current setting updated",
+      machineId: machine.id,
+      machineCode: machine.machineCode,
+      currentSetting: controls.currentSetting,
+    });
+  } catch (error) {
+    return sendInternalError("Set current error", error, res);
+  }
+});
+
+async function resetMachineTelemetry(machine, options = {}) {
+  if (options.clearHistory) {
+    await prisma.telemetry.deleteMany({
+      where: { machineId: machine.id },
+    });
+
+    resetMachineControls(machine.id);
+    return {
+      ...buildZeroTelemetryData(machine.id),
+      id: null,
+      createdAt: null,
+    };
+  }
+
+  resetMachineControls(machine.id);
+
+  return prisma.telemetry.create({
+    data: buildZeroTelemetryData(machine.id),
+  });
+}
+
+function resetJobData(req, res) {
+  return handleMachineReset(req, res);
+}
+
+function resetMachineData(req, res) {
+  return handleMachineReset(req, res, { clearHistory: true });
+}
+
+function resetByScope(req, res) {
+  const scope = String(req.body.scope || req.query.scope || "job").toLowerCase();
+
+  return handleMachineReset(req, res, {
+    clearHistory: scope === "machine" || scope === "all",
+  });
+}
+
+async function handleMachineReset(req, res, options = {}) {
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
+
+    if (!machineIdentifier) {
+      return res.status(400).json({
+        error: "Machine identifier is required",
+      });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: { id: true, machineCode: true },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
+      });
+    }
+
+    const telemetry = await resetMachineTelemetry(machine, options);
+
+    return res.json({
+      message: options.clearHistory
+        ? "Machine data reset successfully"
+        : "Job data reset successfully",
+      machineId: machine.id,
+      machineCode: machine.machineCode,
+      currentSetting: DEFAULT_CURRENT_SETTING,
+      telemetry,
+    });
+  } catch (error) {
+    return sendPrismaWriteError("Machine reset error", error, res);
+  }
+}
+
+router.post("/machine/:id/reset-job-data", resetJobData);
+router.post("/machine/:id/reset-job", resetJobData);
+router.post("/machine/:id/job/reset", resetJobData);
+
+router.post("/machine/:id/reset-machine-data", resetMachineData);
+router.post("/machine/:id/reset-machine", resetMachineData);
+router.post("/machine/:id/data/reset", resetMachineData);
+
+router.post("/machine/:id/reset", resetByScope);
+
 router.get("/telemetry", async (req, res) => {
   try {
     const telemetry = await prisma.telemetry.findMany({
@@ -586,6 +758,7 @@ router.get("/machine/:id/overview", async (req, res) => {
     const secondsSinceLastTelemetry = getSecondsSinceLastTelemetry(telemetry);
     const lastUpdatedAt = getTelemetryTime(telemetry);
     const isFresh = status !== "OFFLINE";
+    const controls = getMachineControls(machine.id);
     const { health, alarms, warnings } = isFresh
       ? buildHealthState(telemetry)
       : buildHealthState(null);
@@ -614,7 +787,7 @@ router.get("/machine/:id/overview", async (req, res) => {
       temperature: isFresh ? telemetry.temperature || 0 : null,
       weldingCurrent: isFresh ? telemetry.outputCurrent || 0 : 0,
       weldingVoltage: isFresh ? telemetry.outputVoltage || 0 : 0,
-      currentSetting: 400,
+      currentSetting: controls.currentSetting,
       fanSpeed: 0,
       inputVoltage: {
         R: isFresh ? telemetry.inputVoltage || 0 : 0,
