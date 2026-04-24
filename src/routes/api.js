@@ -4,6 +4,8 @@ const prisma = require("../db");
 
 const router = express.Router();
 
+const TELEMETRY_FRESHNESS_SECONDS = 60;
+
 function parseMachineId(rawId) {
   const machineId = Number.parseInt(rawId, 10);
 
@@ -113,7 +115,7 @@ function getMachineStatus(telemetry) {
 
   if (
     secondsSinceLastTelemetry === null ||
-    secondsSinceLastTelemetry > 60
+    secondsSinceLastTelemetry > TELEMETRY_FRESHNESS_SECONDS
   ) {
     return "OFFLINE";
   }
@@ -131,7 +133,7 @@ function buildHealthState(telemetry) {
 
   if (!telemetry) {
     return {
-      health: "GREEN",
+      health: "GREY",
       alarms,
       warnings,
     };
@@ -170,6 +172,13 @@ function buildHealthState(telemetry) {
   };
 }
 
+function getHealthLabel(health) {
+  if (health === "RED") return "CRITICAL";
+  if (health === "YELLOW") return "WARNING";
+  if (health === "GREEN") return "HEALTHY";
+  return "GREY";
+}
+
 function buildEmptyOverview(machine) {
   return {
     machineId: machine.id,
@@ -177,7 +186,8 @@ function buildEmptyOverview(machine) {
     serialNumber: machine.serialNumber || "",
     location: machine.location || "Shop Floor",
     status: "OFFLINE",
-    health: "GREEN",
+    health: "GREY",
+    healthLabel: "GREY",
     alarmCount: 0,
     warningCount: 0,
     lastUpdatedAt: null,
@@ -202,6 +212,74 @@ function buildEmptyOverview(machine) {
     warnings: [],
     trend: [],
   };
+}
+
+function buildOfflineFleetMachine(machine, latestTelemetry = null) {
+  return {
+    id: machine.id,
+    machineId: machine.id,
+    code: machine.machineCode,
+    machineCode: machine.machineCode,
+    serialNumber: machine.serialNumber || "",
+    location: machine.location || "Shop Floor",
+    status: "OFFLINE",
+    health: "GREY",
+    healthLabel: "GREY",
+    isLive: false,
+    lastSeen: getTelemetryTime(latestTelemetry),
+    lastUpdatedAt: getTelemetryTime(latestTelemetry),
+    secondsSinceLastTelemetry: getSecondsSinceLastTelemetry(latestTelemetry),
+    current: 0,
+    outputCurrent: 0,
+    temperature: null,
+    warningCount: 0,
+    alarmCount: 0,
+    warnings: [],
+    alarms: [],
+    welder: "Unknown",
+  };
+}
+
+function buildFleetSummary(machines) {
+  return machines.reduce(
+    (summary, machine) => {
+      summary.totalMachines += 1;
+
+      if (machine.status === "OFFLINE") {
+        summary.offlineMachines += 1;
+        return summary;
+      }
+
+      summary.liveMachines += 1;
+
+      if (machine.healthLabel === "WARNING") {
+        summary.warningMachines += 1;
+      }
+
+      if (machine.healthLabel === "CRITICAL") {
+        summary.criticalMachines += 1;
+      }
+
+      return summary;
+    },
+    {
+      totalMachines: 0,
+      liveMachines: 0,
+      offlineMachines: 0,
+      warningMachines: 0,
+      criticalMachines: 0,
+    }
+  );
+}
+
+function setFleetSummaryHeaders(res, summary) {
+  res.set({
+    "X-Fleet-Total-Machines": String(summary.totalMachines),
+    "X-Fleet-Live-Machines": String(summary.liveMachines),
+    "X-Fleet-Offline-Machines": String(summary.offlineMachines),
+    "X-Fleet-Warning-Machines": String(summary.warningMachines),
+    "X-Fleet-Critical-Machines": String(summary.criticalMachines),
+  });
 }
 
 function sendInternalError(context, error, res) {
@@ -504,10 +582,13 @@ router.get("/machine/:id/overview", async (req, res) => {
       return res.json(buildEmptyOverview(machine));
     }
 
-    const { health, alarms, warnings } = buildHealthState(telemetry);
     const status = getMachineStatus(telemetry);
     const secondsSinceLastTelemetry = getSecondsSinceLastTelemetry(telemetry);
     const lastUpdatedAt = getTelemetryTime(telemetry);
+    const isFresh = status !== "OFFLINE";
+    const { health, alarms, warnings } = isFresh
+      ? buildHealthState(telemetry)
+      : buildHealthState(null);
     const trend = historyRaw
       .slice()
       .reverse()
@@ -524,25 +605,26 @@ router.get("/machine/:id/overview", async (req, res) => {
       location: machine.location || "Shop Floor",
       status,
       health,
+      healthLabel: getHealthLabel(health),
       alarmCount: alarms.length,
       warningCount: warnings.length,
       lastUpdatedAt,
       secondsSinceLastTelemetry,
-      outputCurrent: telemetry.outputCurrent || 0,
-      temperature: telemetry.temperature || 0,
-      weldingCurrent: telemetry.outputCurrent || 0,
-      weldingVoltage: telemetry.outputVoltage || 0,
+      outputCurrent: isFresh ? telemetry.outputCurrent || 0 : 0,
+      temperature: isFresh ? telemetry.temperature || 0 : null,
+      weldingCurrent: isFresh ? telemetry.outputCurrent || 0 : 0,
+      weldingVoltage: isFresh ? telemetry.outputVoltage || 0 : 0,
       currentSetting: 400,
       fanSpeed: 0,
       inputVoltage: {
-        R: telemetry.inputVoltage || 0,
-        Y: telemetry.inputVoltage || 0,
-        B: telemetry.inputVoltage || 0,
+        R: isFresh ? telemetry.inputVoltage || 0 : 0,
+        Y: isFresh ? telemetry.inputVoltage || 0 : 0,
+        B: isFresh ? telemetry.inputVoltage || 0 : 0,
       },
       temperatures: {
-        trafoCore: telemetry.temperature || 0,
-        igbt: telemetry.temperature || 0,
-        heatSync: telemetry.temperature || 0,
+        trafoCore: isFresh ? telemetry.temperature || 0 : null,
+        igbt: isFresh ? telemetry.temperature || 0 : null,
+        heatSync: isFresh ? telemetry.temperature || 0 : null,
       },
       alarms,
       warnings,
@@ -579,21 +661,44 @@ router.get("/machines/overview", async (req, res) => {
 
     const result = machines.map((machine) => {
       const latest = machine.telemetry[0] || null;
-      const { health } = buildHealthState(latest);
+      const status = getMachineStatus(latest);
+
+      if (status === "OFFLINE") {
+        return buildOfflineFleetMachine(machine, latest);
+      }
+
+      const { health, alarms, warnings } = buildHealthState(latest);
 
       return {
         id: machine.id,
+        machineId: machine.id,
         code: machine.machineCode,
+        machineCode: machine.machineCode,
         serialNumber: machine.serialNumber || "",
         location: machine.location || "Shop Floor",
-        status: getMachineStatus(latest),
+        status,
         health,
+        healthLabel: getHealthLabel(health),
+        isLive: true,
+        lastSeen: getTelemetryTime(latest),
+        lastUpdatedAt: getTelemetryTime(latest),
+        secondsSinceLastTelemetry: getSecondsSinceLastTelemetry(latest),
         current: latest?.outputCurrent || 0,
+        outputCurrent: latest?.outputCurrent || 0,
         temperature: latest?.temperature || 0,
+        warningCount: warnings.length,
+        alarmCount: alarms.length,
+        warnings,
+        alarms,
         welder: "Unknown",
       };
-    });
+    }).sort(
+      (a, b) =>
+        Number(b.isLive) - Number(a.isLive) ||
+        a.machineCode.localeCompare(b.machineCode)
+    );
 
+    setFleetSummaryHeaders(res, buildFleetSummary(result));
     return res.json(result);
   } catch (error) {
     return sendInternalError("Fleet overview error", error, res);
