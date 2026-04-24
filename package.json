@@ -5,12 +5,18 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js"
+    "dev": "nodemon src/server.js",
+    "db:migrate": "npx prisma migrate deploy",
+    "db:seed": "node prisma/seed.js",
+    "db:serials": "node prisma/updateSerials.js",
+    "db:demo-telemetry": "node prisma/demoTelemetry.js",
+    "postinstall": "prisma generate"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@prisma/adapter-pg": "^7.5.0",
     "@prisma/client": "^7.5.0",
     "cors": "^2.8.6",
     "dotenv": "^16.4.7",

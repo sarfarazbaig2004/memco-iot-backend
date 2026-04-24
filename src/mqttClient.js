@@ -5,6 +5,12 @@ const config = require("./config");
 let client = null;
 let demoTelemetryInterval = null;
 let isStarted = false;
+const mqttState = {
+  enabled: config.enableMqtt,
+  connected: false,
+  subscribedTopic: null,
+  lastError: null,
+};
 
 function parseNumber(value) {
   if (value === undefined || value === null || value === "") {
@@ -42,9 +48,29 @@ function parseTimestamp(value) {
   return Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
 }
 
+function hasOwnValue(payload, key) {
+  return Object.prototype.hasOwnProperty.call(payload, key);
+}
+
 function normalizeTelemetryPayload(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Payload must be a JSON object");
+  }
+
+  // Reject incomplete telemetry packets so downstream analytics stay consistent.
+  const requiredFields = [
+    "machineId",
+    "inputVoltage",
+    "outputVoltage",
+    "outputCurrent",
+    "temperature",
+    "arcOn",
+  ];
+
+  for (const field of requiredFields) {
+    if (!hasOwnValue(payload, field)) {
+      throw new Error(`Missing required telemetry field: ${field}`);
+    }
   }
 
   const machineId = Number.parseInt(payload.machineId, 10);
@@ -53,13 +79,39 @@ function normalizeTelemetryPayload(payload) {
     throw new Error("machineId must be a positive integer");
   }
 
+  const inputVoltage = parseNumber(payload.inputVoltage);
+  const outputVoltage = parseNumber(payload.outputVoltage);
+  const outputCurrent = parseNumber(payload.outputCurrent);
+  const temperature = parseNumber(payload.temperature);
+  const arcOn = parseBoolean(payload.arcOn);
+
+  if (inputVoltage === null) {
+    throw new Error("inputVoltage must be a valid number");
+  }
+
+  if (outputVoltage === null) {
+    throw new Error("outputVoltage must be a valid number");
+  }
+
+  if (outputCurrent === null) {
+    throw new Error("outputCurrent must be a valid number");
+  }
+
+  if (temperature === null) {
+    throw new Error("temperature must be a valid number");
+  }
+
+  if (arcOn === null) {
+    throw new Error('arcOn must be a boolean or "true"/"false" string');
+  }
+
   return {
     machineId,
-    inputVoltage: parseNumber(payload.inputVoltage),
-    outputVoltage: parseNumber(payload.outputVoltage),
-    outputCurrent: parseNumber(payload.outputCurrent),
-    temperature: parseNumber(payload.temperature),
-    arcOn: parseBoolean(payload.arcOn),
+    inputVoltage,
+    outputVoltage,
+    outputCurrent,
+    temperature,
+    arcOn,
     timestamp: parseTimestamp(payload.timestamp),
   };
 }
@@ -95,9 +147,12 @@ async function handleIncomingMessage(topic, message) {
     const telemetry = normalizeTelemetryPayload(payload);
 
     await persistTelemetry(telemetry);
-    console.log(`Saved telemetry for machine ${telemetry.machineId}`);
+    console.log(
+      `[mqtt] saved telemetry for machine ${telemetry.machineId} from topic ${topic}`
+    );
   } catch (error) {
-    console.error(`Failed to process telemetry message on ${topic}:`, error);
+    mqttState.lastError = error.message || String(error);
+    console.error(`[mqtt] failed to process message on ${topic}:`, error);
   }
 }
 
@@ -158,32 +213,52 @@ function startDemoTelemetry() {
 
 function startMqttSubscription() {
   if (!config.enableMqtt) {
-    console.log("MQTT ingestion disabled by configuration");
+    console.log(
+      "[mqtt] ingestion disabled by configuration (set ENABLE_MQTT=true to enable it)"
+    );
     return;
   }
 
   if (client) {
+    console.log("[mqtt] client already initialized");
     return;
   }
 
-  client = mqtt.connect(config.mqttUrl, {
+  client = mqtt.connect(config.mqttBrokerUrl, {
+    // A stable client ID lets Mosquitto track this backend across reconnects.
     clientId: config.mqttClientId,
     connectTimeout: config.mqttConnectTimeoutMs,
-    reconnectPeriod: 5000,
+    reconnectPeriod: config.mqttReconnectPeriodMs,
+    keepalive: config.mqttKeepaliveSeconds,
+    username: config.mqttUsername || undefined,
+    password: config.mqttPassword || undefined,
     clean: true,
+    resubscribe: true,
   });
 
   client.on("connect", () => {
-    console.log(`MQTT connected to ${config.mqttUrl}`);
+    mqttState.connected = true;
+    mqttState.lastError = null;
+    console.log(
+      `[mqtt] connected to ${config.mqttBrokerUrl} as ${config.mqttClientId}`
+    );
 
-    client.subscribe(config.mqttTopic, (error) => {
-      if (error) {
-        console.error("MQTT subscribe error:", error);
-        return;
+    client.subscribe(
+      config.mqttTopic,
+      { qos: config.mqttSubscribeQos },
+      (error) => {
+        if (error) {
+          mqttState.lastError = error.message || String(error);
+          console.error(`[mqtt] subscribe error for ${config.mqttTopic}:`, error);
+          return;
+        }
+
+        mqttState.subscribedTopic = config.mqttTopic;
+        console.log(
+          `[mqtt] subscribed to topic ${config.mqttTopic} with qos ${config.mqttSubscribeQos}`
+        );
       }
-
-      console.log(`Subscribed to MQTT topic ${config.mqttTopic}`);
-    });
+    );
   });
 
   client.on("message", (topic, message) => {
@@ -191,19 +266,30 @@ function startMqttSubscription() {
   });
 
   client.on("reconnect", () => {
-    console.warn("MQTT reconnecting...");
+    mqttState.connected = false;
+    console.warn(
+      `[mqtt] reconnecting in ${config.mqttReconnectPeriodMs} ms...`
+    );
   });
 
   client.on("offline", () => {
-    console.warn("MQTT client is offline");
+    mqttState.connected = false;
+    console.warn("[mqtt] client is offline");
   });
 
   client.on("close", () => {
-    console.warn("MQTT connection closed");
+    mqttState.connected = false;
+    console.warn("[mqtt] connection closed");
   });
 
   client.on("error", (error) => {
-    console.error("MQTT client error:", error);
+    mqttState.lastError = error.message || String(error);
+    console.error("[mqtt] client error:", error);
+  });
+
+  client.on("end", () => {
+    mqttState.connected = false;
+    console.log("[mqtt] client ended");
   });
 }
 
@@ -213,7 +299,14 @@ function startTelemetryService() {
   }
 
   isStarted = true;
-  startMqttSubscription();
+  // MQTT startup is isolated so broker issues never prevent the API from serving traffic.
+  try {
+    startMqttSubscription();
+  } catch (error) {
+    mqttState.lastError = error.message || String(error);
+    console.error("[mqtt] startup failed, continuing without MQTT:", error);
+  }
+
   startDemoTelemetry();
 }
 
@@ -231,13 +324,21 @@ async function stopTelemetryService() {
       activeClient.end(true, {}, resolve);
     });
 
-    console.log("MQTT client stopped");
+    mqttState.connected = false;
+    mqttState.subscribedTopic = null;
+    console.log("[mqtt] client stopped");
   }
 
   isStarted = false;
 }
 
 module.exports = {
+  getTelemetryServiceStatus: () => ({
+    ...mqttState,
+    topic: config.mqttTopic,
+    clientId: config.mqttClientId,
+    url: config.mqttBrokerUrl,
+  }),
   startTelemetryService,
   stopTelemetryService,
 };

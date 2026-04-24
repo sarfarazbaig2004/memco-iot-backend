@@ -4,6 +4,7 @@ const cors = require("cors");
 const config = require("./config");
 const prisma = require("./db");
 const {
+  getTelemetryServiceStatus,
   startTelemetryService,
   stopTelemetryService,
 } = require("./mqttClient");
@@ -28,9 +29,16 @@ const apiRoutes = require("./routes/api");
 app.use("/api", apiRoutes);
 
 app.get(["/", "/health"], (req, res) => {
+  const telemetryStatus = getTelemetryServiceStatus();
+
   res.status(200).json({
-    status: "OK",
+    status: "ok",
     message: "MEMCO IoT Backend Running",
+    mqtt: {
+      enabled: telemetryStatus.enabled,
+      connected: telemetryStatus.connected,
+      subscribedTopic: telemetryStatus.subscribedTopic,
+    },
     uptimeSeconds: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
   });
@@ -71,6 +79,8 @@ app.use((error, req, res, next) => {
 
 async function startServer() {
   await prisma.connectDB();
+
+  // MQTT is optional infrastructure; the API should stay up even if the broker is down.
   startTelemetryService();
 
   await new Promise((resolve) => {

@@ -10,6 +10,36 @@ function parseMachineId(rawId) {
   return Number.isInteger(machineId) && machineId > 0 ? machineId : null;
 }
 
+function parseMachineIdentifier(rawId) {
+  if (rawId === undefined || rawId === null) {
+    return null;
+  }
+
+  const machineIdentifier = String(rawId).trim();
+
+  return machineIdentifier || null;
+}
+
+async function findMachineByIdentifier(machineIdentifier, queryOptions = {}) {
+  const numericMachineId = parseMachineId(machineIdentifier);
+
+  if (numericMachineId) {
+    const machineById = await prisma.machine.findUnique({
+      where: { id: numericMachineId },
+      ...queryOptions,
+    });
+
+    if (machineById) {
+      return machineById;
+    }
+  }
+
+  return prisma.machine.findFirst({
+    where: { machineCode: machineIdentifier },
+    ...queryOptions,
+  });
+}
+
 function parseOptionalNumber(value) {
   if (value === undefined || value === null || value === "") {
     return null;
@@ -50,20 +80,49 @@ function parseTimestamp(value) {
   return Number.isNaN(parsedValue.getTime()) ? null : parsedValue;
 }
 
-function buildMachineStatus(telemetry) {
+function getTelemetryTime(telemetry) {
   if (!telemetry) {
-    return "OFF";
+    return null;
   }
 
-  if (telemetry.arcOn === true && (telemetry.outputCurrent || 0) > 50) {
+  return telemetry.timestamp || telemetry.createdAt || null;
+}
+
+function getSecondsSinceLastTelemetry(telemetry) {
+  const lastTime = getTelemetryTime(telemetry);
+
+  if (!lastTime) {
+    return null;
+  }
+
+  const parsedLastTime = new Date(lastTime);
+
+  if (Number.isNaN(parsedLastTime.getTime())) {
+    return null;
+  }
+
+  return Math.floor((Date.now() - parsedLastTime.getTime()) / 1000);
+}
+
+function getMachineStatus(telemetry) {
+  if (!telemetry) {
+    return "OFFLINE";
+  }
+
+  const secondsSinceLastTelemetry = getSecondsSinceLastTelemetry(telemetry);
+
+  if (
+    secondsSinceLastTelemetry === null ||
+    secondsSinceLastTelemetry > 60
+  ) {
+    return "OFFLINE";
+  }
+
+  if (telemetry.arcOn === true || Number(telemetry.outputCurrent) > 20) {
     return "WELDING";
   }
 
-  if ((telemetry.inputVoltage || 0) > 100) {
-    return "IDLE";
-  }
-
-  return "OFF";
+  return "IDLE";
 }
 
 function buildHealthState(telemetry) {
@@ -117,11 +176,14 @@ function buildEmptyOverview(machine) {
     machineCode: machine.machineCode,
     serialNumber: machine.serialNumber || "",
     location: machine.location || "Shop Floor",
-    status: "OFF",
+    status: "OFFLINE",
     health: "GREEN",
     alarmCount: 0,
     warningCount: 0,
     lastUpdatedAt: null,
+    secondsSinceLastTelemetry: null,
+    outputCurrent: 0,
+    temperature: 0,
     weldingCurrent: 0,
     weldingVoltage: 0,
     currentSetting: 400,
@@ -131,7 +193,7 @@ function buildEmptyOverview(machine) {
       Y: 0,
       B: 0,
     },
-    temperature: {
+    temperatures: {
       trafoCore: 0,
       igbt: 0,
       heatSync: 0,
@@ -243,11 +305,11 @@ router.post("/telemetry", async (req, res) => {
       arcOn,
     } = req.body;
 
-    const parsedMachineId = parseMachineId(machineId);
+    const machineIdentifier = parseMachineIdentifier(machineId);
 
-    if (!parsedMachineId) {
+    if (!machineIdentifier) {
       return res.status(400).json({
-        error: "machineId must be a positive integer",
+        error: "machineId is required",
       });
     }
 
@@ -286,20 +348,19 @@ router.post("/telemetry", async (req, res) => {
       });
     }
 
-    const machine = await prisma.machine.findUnique({
-      where: { id: parsedMachineId },
+    const machine = await findMachineByIdentifier(machineIdentifier, {
       select: { id: true },
     });
 
     if (!machine) {
       return res.status(404).json({
-        error: `Machine with id ${parsedMachineId} not found`,
+        error: `Machine with identifier ${machineIdentifier} not found`,
       });
     }
 
     const telemetry = await prisma.telemetry.create({
       data: {
-        machineId: parsedMachineId,
+        machineId: machine.id,
         timestamp: parsedTimestamp,
         inputVoltage: parsedInputVoltage,
         outputVoltage: parsedOutputVoltage,
@@ -336,16 +397,15 @@ router.get("/telemetry", async (req, res) => {
 
 router.get("/machine/:id", async (req, res) => {
   try {
-    const machineId = parseMachineId(req.params.id);
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
 
-    if (!machineId) {
+    if (!machineIdentifier) {
       return res.status(400).json({
-        error: "Machine id must be a positive integer",
+        error: "Machine identifier is required",
       });
     }
 
-    const machine = await prisma.machine.findUnique({
-      where: { id: machineId },
+    const machine = await findMachineByIdentifier(machineIdentifier, {
       include: {
         company: true,
         telemetry: {
@@ -356,7 +416,7 @@ router.get("/machine/:id", async (req, res) => {
 
     if (!machine) {
       return res.status(404).json({
-        error: "Machine not found",
+        error: `Machine with identifier ${machineIdentifier} not found`,
       });
     }
 
@@ -368,16 +428,26 @@ router.get("/machine/:id", async (req, res) => {
 
 router.get("/machine/:id/latest", async (req, res) => {
   try {
-    const machineId = parseMachineId(req.params.id);
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
 
-    if (!machineId) {
+    if (!machineIdentifier) {
       return res.status(400).json({
-        error: "Machine id must be a positive integer",
+        error: "Machine identifier is required",
+      });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: { id: true },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
       });
     }
 
     const latestTelemetry = await prisma.telemetry.findFirst({
-      where: { machineId },
+      where: { machineId: machine.id },
       orderBy: [{ timestamp: "desc" }, { id: "desc" }],
     });
 
@@ -395,47 +465,49 @@ router.get("/machine/:id/latest", async (req, res) => {
 
 router.get("/machine/:id/overview", async (req, res) => {
   try {
-    const machineId = parseMachineId(req.params.id);
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
 
-    if (!machineId) {
+    if (!machineIdentifier) {
       return res.status(400).json({
-        error: "Machine id must be a positive integer",
+        error: "Machine identifier is required",
       });
     }
 
-    const [machine, telemetry, historyRaw] = await Promise.all([
-      prisma.machine.findUnique({
-        where: { id: machineId },
-        select: {
-          id: true,
-          machineCode: true,
-          serialNumber: true,
-          location: true,
-        },
-      }),
-      prisma.telemetry.findFirst({
-        where: { machineId },
-        orderBy: [{ timestamp: "desc" }, { id: "desc" }],
-      }),
-      prisma.telemetry.findMany({
-        where: { machineId },
-        orderBy: [{ timestamp: "desc" }, { id: "desc" }],
-        take: 20,
-      }),
-    ]);
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: {
+        id: true,
+        machineCode: true,
+        serialNumber: true,
+        location: true,
+      },
+    });
 
     if (!machine) {
       return res.status(404).json({
-        error: "Machine not found",
+        error: `Machine with identifier ${machineIdentifier} not found`,
       });
     }
+
+    const [telemetry, historyRaw] = await Promise.all([
+      prisma.telemetry.findFirst({
+        where: { machineId: machine.id },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      }),
+      prisma.telemetry.findMany({
+        where: { machineId: machine.id },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: 20,
+      }),
+    ]);
 
     if (!telemetry) {
       return res.json(buildEmptyOverview(machine));
     }
 
     const { health, alarms, warnings } = buildHealthState(telemetry);
-    const status = buildMachineStatus(telemetry);
+    const status = getMachineStatus(telemetry);
+    const secondsSinceLastTelemetry = getSecondsSinceLastTelemetry(telemetry);
+    const lastUpdatedAt = getTelemetryTime(telemetry);
     const trend = historyRaw
       .slice()
       .reverse()
@@ -454,7 +526,10 @@ router.get("/machine/:id/overview", async (req, res) => {
       health,
       alarmCount: alarms.length,
       warningCount: warnings.length,
-      lastUpdatedAt: telemetry.timestamp || telemetry.createdAt,
+      lastUpdatedAt,
+      secondsSinceLastTelemetry,
+      outputCurrent: telemetry.outputCurrent || 0,
+      temperature: telemetry.temperature || 0,
       weldingCurrent: telemetry.outputCurrent || 0,
       weldingVoltage: telemetry.outputVoltage || 0,
       currentSetting: 400,
@@ -464,7 +539,7 @@ router.get("/machine/:id/overview", async (req, res) => {
         Y: telemetry.inputVoltage || 0,
         B: telemetry.inputVoltage || 0,
       },
-      temperature: {
+      temperatures: {
         trafoCore: telemetry.temperature || 0,
         igbt: telemetry.temperature || 0,
         heatSync: telemetry.temperature || 0,
@@ -488,10 +563,12 @@ router.get("/machines/overview", async (req, res) => {
         serialNumber: true,
         location: true,
         telemetry: {
-          orderBy: [{ timestamp: "desc" }, { id: "desc" }],
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
           take: 1,
           select: {
             arcOn: true,
+            timestamp: true,
+            createdAt: true,
             inputVoltage: true,
             outputCurrent: true,
             temperature: true,
@@ -509,7 +586,7 @@ router.get("/machines/overview", async (req, res) => {
         code: machine.machineCode,
         serialNumber: machine.serialNumber || "",
         location: machine.location || "Shop Floor",
-        status: buildMachineStatus(latest),
+        status: getMachineStatus(latest),
         health,
         current: latest?.outputCurrent || 0,
         temperature: latest?.temperature || 0,
