@@ -81,7 +81,7 @@ module.exports = Object.freeze({
     "mqtt://localhost:1883",
   mqttClientId:
     process.env.MQTT_CLIENT_ID || `memco-backend-${os.hostname()}-${process.pid}`,
-  mqttTopic: process.env.MQTT_TOPIC || "machine/data",
+  mqttTopic: process.env.MQTT_TOPIC || "machine/data/#",
   mqttReconnectPeriodMs: parseIntegerEnv("MQTT_RECONNECT_PERIOD_MS", 5000, {
     min: 1000,
   }),

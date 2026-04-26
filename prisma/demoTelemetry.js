@@ -23,6 +23,9 @@ async function main() {
         outputVoltage: isWelding ? Math.round(24 + Math.random() * 8) : 0,
         outputCurrent: isWelding ? Math.round(180 + Math.random() * 180) : 0,
         temperature: Math.round(50 + Math.random() * 40),
+        trafoCoreTemperature: Math.round(50 + Math.random() * 40),
+        igbtTemperature: Math.round(45 + Math.random() * 35),
+        heatSyncTemperature: Math.round(40 + Math.random() * 30),
         arcOn: isWelding,
       },
     });

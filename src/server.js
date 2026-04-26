@@ -8,6 +8,7 @@ const {
   startTelemetryService,
   stopTelemetryService,
 } = require("./mqttClient");
+const { authMiddleware } = require("./auth");
 
 const app = express();
 let server = null;
@@ -24,6 +25,7 @@ app.use(
   )
 );
 app.use(express.json({ limit: "1mb" }));
+app.use(authMiddleware);
 
 const apiRoutes = require("./routes/api");
 app.use("/api", apiRoutes);

@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const prisma = require("../src/db");
+const { hashPassword } = require("../src/auth");
 
 async function main() {
   const companyCode = "WM-001";
@@ -46,6 +47,106 @@ async function main() {
   }
 
   console.log("✅ 50 machines created or already present");
+
+  await prisma.welder.upsert({
+    where: { rfidCardNo: "RFID-000127" },
+    create: {
+      name: "Mohd. Arif",
+      employeeCode: "WLD-019",
+      rfidCardNo: "RFID-000127",
+      active: true,
+    },
+    update: {
+      name: "Mohd. Arif",
+      employeeCode: "WLD-019",
+      active: true,
+    },
+  });
+
+  console.log("✅ Demo welder RFID-000127 created or already present");
+
+  await prisma.user.upsert({
+    where: { email: "superadmin@memco.com" },
+    create: {
+      name: "MEMCO Super Admin",
+      email: "superadmin@memco.com",
+      passwordHash: hashPassword("Admin@123"),
+      role: "SUPER_ADMIN",
+      active: true,
+    },
+    update: {
+      name: "MEMCO Super Admin",
+      role: "SUPER_ADMIN",
+      active: true,
+    },
+  });
+
+  const demoCustomer = await prisma.user.upsert({
+    where: { email: "customer@demo.com" },
+    create: {
+      name: "Demo Customer",
+      email: "customer@demo.com",
+      passwordHash: hashPassword("Customer@123"),
+      role: "CUSTOMER",
+      active: true,
+    },
+    update: {
+      name: "Demo Customer",
+      role: "CUSTOMER",
+      active: true,
+    },
+  });
+
+  await prisma.user.upsert({
+    where: { email: "genzprotech@gmail.com" },
+    create: {
+      name: "Genz Protech",
+      email: "genzprotech@gmail.com",
+      passwordHash: hashPassword("Mohamed@7867"),
+      role: "SUPER_ADMIN",
+      active: true,
+    },
+    update: {
+      name: "Genz Protech",
+      role: "SUPER_ADMIN",
+      active: true,
+    },
+  });
+
+  console.log("✅ Demo auth users created or already present");
+
+  await prisma.userModuleAccess.deleteMany({
+    where: { userId: demoCustomer.id },
+  });
+  await prisma.userModuleAccess.createMany({
+    data: [
+      {
+        userId: demoCustomer.id,
+        moduleKey: "reports",
+        enabled: true,
+      },
+    ],
+  });
+
+  const demoMachines = await prisma.machine.findMany({
+    where: { machineCode: { in: ["WM-001", "WM-002"] } },
+    select: { id: true },
+  });
+
+  await prisma.userMachineAccess.deleteMany({
+    where: { userId: demoCustomer.id },
+  });
+
+  if (demoMachines.length > 0) {
+    await prisma.userMachineAccess.createMany({
+      data: demoMachines.map((machine) => ({
+        userId: demoCustomer.id,
+        machineId: machine.id,
+      })),
+    });
+  }
+
+  console.log("✅ Demo customer access created or already present");
 }
 
 prisma

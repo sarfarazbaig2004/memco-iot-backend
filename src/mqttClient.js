@@ -1,6 +1,9 @@
 const mqtt = require("mqtt");
 const prisma = require("./db");
 const config = require("./config");
+const {
+  updateActiveWelderSessionFromTelemetry,
+} = require("./welderSessions");
 
 let client = null;
 let demoTelemetryInterval = null;
@@ -20,6 +23,67 @@ function parseNumber(value) {
   const parsedValue = Number(value);
 
   return Number.isFinite(parsedValue) ? parsedValue : null;
+}
+
+function parseMachineIdentifierFromTopic(topic) {
+  if (typeof topic !== "string") {
+    return null;
+  }
+
+  const topicPrefix = "machine/data/";
+
+  if (!topic.startsWith(topicPrefix)) {
+    return null;
+  }
+
+  const machineIdentifier = topic.slice(topicPrefix.length).trim();
+
+  return machineIdentifier && !machineIdentifier.includes("/")
+    ? machineIdentifier
+    : null;
+}
+
+function parseMachineIdentifier(payload, topic) {
+  const hasMachineCode =
+    hasOwnValue(payload, "machineCode") &&
+    payload.machineCode !== undefined &&
+    payload.machineCode !== null &&
+    String(payload.machineCode).trim() !== "";
+  const rawIdentifier = hasMachineCode
+    ? payload.machineCode
+    : payload.machineId;
+
+  if (rawIdentifier !== undefined && rawIdentifier !== null) {
+    const machineIdentifier = String(rawIdentifier).trim();
+
+    if (machineIdentifier) {
+      return machineIdentifier;
+    }
+  }
+
+  return parseMachineIdentifierFromTopic(topic);
+}
+
+async function findMachineByIdentifier(machineIdentifier) {
+  const numericMachineId = /^\d+$/.test(machineIdentifier)
+    ? Number.parseInt(machineIdentifier, 10)
+    : null;
+
+  if (Number.isInteger(numericMachineId) && numericMachineId > 0) {
+    const machineById = await prisma.machine.findUnique({
+      where: { id: numericMachineId },
+      select: { id: true, machineCode: true },
+    });
+
+    if (machineById) {
+      return machineById;
+    }
+  }
+
+  return prisma.machine.findFirst({
+    where: { machineCode: machineIdentifier },
+    select: { id: true, machineCode: true },
+  });
 }
 
 function parseBoolean(value) {
@@ -52,18 +116,37 @@ function hasOwnValue(payload, key) {
   return Object.prototype.hasOwnProperty.call(payload, key);
 }
 
-function normalizeTelemetryPayload(payload) {
+function getFirstValidNumber(...values) {
+  for (const value of values) {
+    const parsedValue = parseNumber(value);
+
+    if (parsedValue !== null) {
+      return parsedValue;
+    }
+  }
+
+  return null;
+}
+
+function deriveTemperature(...temperatures) {
+  const validTemperatures = temperatures.filter((value) => value !== null);
+
+  if (!validTemperatures.length) {
+    return null;
+  }
+
+  return Math.max(...validTemperatures);
+}
+
+function normalizeTelemetryPayload(payload, topic) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Payload must be a JSON object");
   }
 
-  // Reject incomplete telemetry packets so downstream analytics stay consistent.
   const requiredFields = [
-    "machineId",
     "inputVoltage",
     "outputVoltage",
     "outputCurrent",
-    "temperature",
     "arcOn",
   ];
 
@@ -73,16 +156,34 @@ function normalizeTelemetryPayload(payload) {
     }
   }
 
-  const machineId = Number.parseInt(payload.machineId, 10);
+  const machineIdentifier = parseMachineIdentifier(payload, topic);
 
-  if (!Number.isInteger(machineId) || machineId <= 0) {
-    throw new Error("machineId must be a positive integer");
+  if (!machineIdentifier) {
+    throw new Error(
+      "machineId, machineCode, or machine topic suffix is required"
+    );
   }
 
   const inputVoltage = parseNumber(payload.inputVoltage);
   const outputVoltage = parseNumber(payload.outputVoltage);
   const outputCurrent = parseNumber(payload.outputCurrent);
-  const temperature = parseNumber(payload.temperature);
+  const trafoCoreTemperature = getFirstValidNumber(
+    payload.trafoCoreTemperature,
+    payload.transformerCoreTemperature
+  );
+  const igbtTemperature = parseNumber(payload.igbtTemperature);
+  const heatSyncTemperature = getFirstValidNumber(
+    payload.heatSyncTemperature,
+    payload.heatSinkTemperature
+  );
+  const temperature = getFirstValidNumber(
+    payload.temperature,
+    deriveTemperature(
+      trafoCoreTemperature,
+      igbtTemperature,
+      heatSyncTemperature
+    )
+  );
   const arcOn = parseBoolean(payload.arcOn);
 
   if (inputVoltage === null) {
@@ -106,31 +207,53 @@ function normalizeTelemetryPayload(payload) {
   }
 
   return {
-    machineId,
+    machineIdentifier,
     inputVoltage,
     outputVoltage,
     outputCurrent,
     temperature,
+    trafoCoreTemperature,
+    igbtTemperature,
+    heatSyncTemperature,
     arcOn,
     timestamp: parseTimestamp(payload.timestamp),
   };
 }
 
 async function persistTelemetry(telemetry) {
-  try {
-    await prisma.telemetry.create({
-      data: telemetry,
-    });
-  } catch (error) {
-    if (error.code === "P2003") {
-      console.warn(
-        `Skipping telemetry for unknown machine ${telemetry.machineId}`
-      );
-      return;
-    }
+  const machine = await findMachineByIdentifier(telemetry.machineIdentifier);
 
-    throw error;
+  if (!machine) {
+    throw new Error(
+      `Machine not found for identifier ${telemetry.machineIdentifier}`
+    );
   }
+
+  console.log(
+    `[mqtt] machine resolved ${telemetry.machineIdentifier} -> id ${machine.id}`
+  );
+
+  const savedTelemetry = await prisma.telemetry.create({
+    data: {
+      machineId: machine.id,
+      timestamp: telemetry.timestamp,
+      inputVoltage: telemetry.inputVoltage,
+      outputVoltage: telemetry.outputVoltage,
+      outputCurrent: telemetry.outputCurrent,
+      temperature: telemetry.temperature,
+      trafoCoreTemperature: telemetry.trafoCoreTemperature,
+      igbtTemperature: telemetry.igbtTemperature,
+      heatSyncTemperature: telemetry.heatSyncTemperature,
+      arcOn: telemetry.arcOn,
+    },
+  });
+
+  await updateActiveWelderSessionFromTelemetry(savedTelemetry);
+
+  return {
+    machine,
+    telemetry: savedTelemetry,
+  };
 }
 
 async function handleIncomingMessage(topic, message) {
@@ -138,20 +261,27 @@ async function handleIncomingMessage(topic, message) {
 
   try {
     payload = JSON.parse(message.toString());
+    console.log(`[mqtt] MQTT received on ${topic}:`, payload);
   } catch (_error) {
     console.warn(`Ignoring non-JSON payload received on topic ${topic}`);
     return;
   }
 
   try {
-    const telemetry = normalizeTelemetryPayload(payload);
+    const telemetry = normalizeTelemetryPayload(payload, topic);
 
-    await persistTelemetry(telemetry);
+    const result = await persistTelemetry(telemetry);
     console.log(
-      `[mqtt] saved telemetry for machine ${telemetry.machineId} from topic ${topic}`
+      `[mqtt] telemetry saved for ${result.machine.machineCode} (id ${result.machine.id}) from topic ${topic}`
     );
   } catch (error) {
     mqttState.lastError = error.message || String(error);
+
+    if (String(error.message || "").startsWith("Machine not found")) {
+      console.error(`[mqtt] ${error.message}`);
+      return;
+    }
+
     console.error(`[mqtt] failed to process message on ${topic}:`, error);
   }
 }
@@ -178,6 +308,9 @@ async function generateFleetTelemetry() {
       outputVoltage: isWelding ? 24 + Math.random() * 8 : 0,
       outputCurrent: isWelding ? 180 + Math.random() * 170 : 0,
       temperature: 50 + Math.random() * 40,
+      trafoCoreTemperature: 50 + Math.random() * 40,
+      igbtTemperature: 45 + Math.random() * 35,
+      heatSyncTemperature: 40 + Math.random() * 30,
       arcOn: isWelding,
     };
   });

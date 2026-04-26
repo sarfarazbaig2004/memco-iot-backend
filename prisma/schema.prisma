@@ -28,6 +28,8 @@ model Machine {
   serialNumber String?     @unique
   company      Company     @relation(fields: [companyId], references: [id])
   telemetry    Telemetry[]
+  welderSessions WelderSession[]
+  userAccesses UserMachineAccess[]
 }
 
 model Telemetry {
@@ -38,7 +40,79 @@ model Telemetry {
   outputVoltage Float?
   outputCurrent Float?
   temperature   Float?
+  trafoCoreTemperature Float?
+  igbtTemperature      Float?
+  heatSyncTemperature  Float?
   arcOn         Boolean?
   createdAt     DateTime @default(now())
   machine       Machine  @relation(fields: [machineId], references: [id])
+}
+
+model Welder {
+  id           Int             @id @default(autoincrement())
+  name         String
+  employeeCode String          @unique
+  rfidCardNo   String          @unique
+  active       Boolean         @default(true)
+  sessions     WelderSession[]
+}
+
+model WelderSession {
+  id                 Int       @id @default(autoincrement())
+  welderId           Int
+  machineId          Int
+  rfidCardNo          String
+  startedAt           DateTime  @default(now())
+  endedAt             DateTime?
+  status              String    @default("ACTIVE")
+  arcingTimeSeconds   Int       @default(0)
+  idleTimeSeconds     Int       @default(0)
+  lastTelemetryAt     DateTime?
+  energy              Float     @default(0)
+  deposition          Float     @default(0)
+  arcCount            Int       @default(0)
+  lastArcOn           Boolean   @default(false)
+  welder              Welder    @relation(fields: [welderId], references: [id])
+  machine             Machine   @relation(fields: [machineId], references: [id])
+
+  @@index([machineId, status])
+  @@index([welderId, status])
+  @@index([rfidCardNo])
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         String   @default("CUSTOMER")
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  moduleAccesses UserModuleAccess[]
+  machineAccesses UserMachineAccess[]
+}
+
+model UserModuleAccess {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  moduleKey String
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, moduleKey])
+  @@index([moduleKey])
+}
+
+model UserMachineAccess {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  machineId Int
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  machine   Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, machineId])
+  @@index([machineId])
 }

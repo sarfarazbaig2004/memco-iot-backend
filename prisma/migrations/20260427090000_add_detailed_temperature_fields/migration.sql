@@ -1,0 +1,4 @@
+ALTER TABLE "Telemetry"
+ADD COLUMN "trafoCoreTemperature" DOUBLE PRECISION,
+ADD COLUMN "igbtTemperature" DOUBLE PRECISION,
+ADD COLUMN "heatSyncTemperature" DOUBLE PRECISION;
