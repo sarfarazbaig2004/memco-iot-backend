@@ -224,6 +224,16 @@ function parseOptionalBoolean(value) {
   return null;
 }
 
+function parseOptionalString(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const parsedValue = String(value).trim();
+
+  return parsedValue || null;
+}
+
 function parseTimestamp(value) {
   if (!value) {
     return new Date();
@@ -277,6 +287,15 @@ function getMachineStatus(telemetry) {
   }
 
   return "IDLE";
+}
+
+function getTelemetryGps(telemetry) {
+  return {
+    gpsFix: telemetry?.gpsFix ?? null,
+    gpsLat: telemetry?.gpsLat ?? null,
+    gpsLng: telemetry?.gpsLng ?? null,
+    mapUrl: telemetry?.mapUrl ?? null,
+  };
 }
 
 function buildHealthState(telemetry) {
@@ -352,6 +371,7 @@ function buildEmptyOverview(machine) {
     trafoCoreTemperature: 0,
     igbtTemperature: 0,
     heatSyncTemperature: 0,
+    ...getTelemetryGps(null),
     weldingCurrent: 0,
     weldingVoltage: 0,
     currentSetting: controls.currentSetting,
@@ -410,6 +430,10 @@ function buildZeroTelemetryData(machineId) {
     igbtTemperature: 0,
     heatSyncTemperature: 0,
     arcOn: false,
+    gpsFix: null,
+    gpsLat: null,
+    gpsLng: null,
+    mapUrl: null,
   };
 }
 
@@ -434,6 +458,7 @@ function buildOfflineFleetMachine(machine, latestTelemetry = null) {
     trafoCoreTemperature: null,
     igbtTemperature: null,
     heatSyncTemperature: null,
+    ...getTelemetryGps(latestTelemetry),
     warningCount: 0,
     alarmCount: 0,
     warnings: [],
@@ -1042,6 +1067,10 @@ router.post("/telemetry", async (req, res) => {
       heatSyncTemperature,
       heatSinkTemperature,
       arcOn,
+      gpsFix,
+      gpsLat,
+      gpsLng,
+      mapUrl,
     } = req.body;
 
     const machineIdentifier = parseMachineIdentifier(machineId);
@@ -1065,6 +1094,10 @@ router.post("/telemetry", async (req, res) => {
       parseOptionalNumber(heatSyncTemperature),
       parseOptionalNumber(heatSinkTemperature)
     );
+    const parsedGpsFix = parseOptionalBoolean(gpsFix);
+    const parsedGpsLat = parseOptionalNumber(gpsLat);
+    const parsedGpsLng = parseOptionalNumber(gpsLng);
+    const parsedMapUrl = parseOptionalString(mapUrl);
     const parsedTemperature = firstPresentNumber(
       parseOptionalNumber(temperature),
       Math.max(
@@ -1090,10 +1123,13 @@ router.post("/telemetry", async (req, res) => {
       Number.isNaN(parsedTemperature) ||
       Number.isNaN(parsedTrafoCoreTemperature) ||
       Number.isNaN(parsedIgbtTemperature) ||
-      Number.isNaN(parsedHeatSyncTemperature)
+      Number.isNaN(parsedHeatSyncTemperature) ||
+      Number.isNaN(parsedGpsLat) ||
+      Number.isNaN(parsedGpsLng)
     ) {
       return res.status(400).json({
-        error: "Voltage, current, and temperature values must be valid numbers",
+        error:
+          "Voltage, current, temperature, and GPS coordinate values must be valid numbers",
       });
     }
 
@@ -1105,6 +1141,17 @@ router.post("/telemetry", async (req, res) => {
     ) {
       return res.status(400).json({
         error: 'arcOn must be either true, false, "true", or "false"',
+      });
+    }
+
+    if (
+      gpsFix !== undefined &&
+      gpsFix !== null &&
+      gpsFix !== "" &&
+      parsedGpsFix === null
+    ) {
+      return res.status(400).json({
+        error: 'gpsFix must be either true, false, "true", or "false"',
       });
     }
 
@@ -1130,6 +1177,10 @@ router.post("/telemetry", async (req, res) => {
         igbtTemperature: parsedIgbtTemperature,
         heatSyncTemperature: parsedHeatSyncTemperature,
         arcOn: parsedArcOn,
+        gpsFix: parsedGpsFix,
+        gpsLat: parsedGpsLat,
+        gpsLng: parsedGpsLng,
+        mapUrl: parsedMapUrl,
       },
     });
 
@@ -1621,6 +1672,7 @@ router.get("/machine/:id/overview", async (req, res) => {
     const temperatures = isFresh
       ? getTelemetryTemperatures(telemetry)
       : getTelemetryTemperatures(null);
+    const gps = getTelemetryGps(telemetry);
 
     return res.json({
       machineId: machine.id,
@@ -1639,6 +1691,7 @@ router.get("/machine/:id/overview", async (req, res) => {
       trafoCoreTemperature: temperatures.trafoCore,
       igbtTemperature: temperatures.igbt,
       heatSyncTemperature: temperatures.heatSync,
+      ...gps,
       weldingCurrent: isFresh ? telemetry.outputCurrent || 0 : 0,
       weldingVoltage: isFresh ? telemetry.outputVoltage || 0 : 0,
       currentSetting: controls.currentSetting,
@@ -1691,6 +1744,10 @@ router.get("/machines/overview", async (req, res) => {
             trafoCoreTemperature: true,
             igbtTemperature: true,
             heatSyncTemperature: true,
+            gpsFix: true,
+            gpsLat: true,
+            gpsLng: true,
+            mapUrl: true,
           },
         },
         welderSessions: {
@@ -1720,6 +1777,7 @@ router.get("/machines/overview", async (req, res) => {
       const activeSession = machine.welderSessions[0] || null;
       const status = getMachineStatus(latest);
       const temperature = deriveTelemetryTemperature(latest);
+      const gps = getTelemetryGps(latest);
 
       if (status === "OFFLINE") {
         return {
@@ -1751,6 +1809,7 @@ router.get("/machines/overview", async (req, res) => {
         trafoCoreTemperature: latest?.trafoCoreTemperature ?? temperature,
         igbtTemperature: latest?.igbtTemperature ?? temperature,
         heatSyncTemperature: latest?.heatSyncTemperature ?? temperature,
+        ...gps,
         warningCount: warnings.length,
         alarmCount: alarms.length,
         warnings,

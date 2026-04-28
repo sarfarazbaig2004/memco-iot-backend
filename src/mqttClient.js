@@ -102,6 +102,24 @@ function parseBoolean(value) {
   return null;
 }
 
+function parseOptionalBoolean(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  return parseBoolean(value);
+}
+
+function parseOptionalString(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const parsedValue = String(value).trim();
+
+  return parsedValue || null;
+}
+
 function parseTimestamp(value) {
   if (!value) {
     return new Date();
@@ -176,6 +194,10 @@ function normalizeTelemetryPayload(payload, topic) {
     payload.heatSyncTemperature,
     payload.heatSinkTemperature
   );
+  const gpsFix = parseOptionalBoolean(payload.gpsFix);
+  const gpsLat = parseNumber(payload.gpsLat);
+  const gpsLng = parseNumber(payload.gpsLng);
+  const mapUrl = parseOptionalString(payload.mapUrl);
   const temperature = getFirstValidNumber(
     payload.temperature,
     deriveTemperature(
@@ -206,6 +228,22 @@ function normalizeTelemetryPayload(payload, topic) {
     throw new Error('arcOn must be a boolean or "true"/"false" string');
   }
 
+  if (
+    payload.gpsFix !== undefined &&
+    payload.gpsFix !== null &&
+    payload.gpsFix !== "" &&
+    gpsFix === null
+  ) {
+    throw new Error('gpsFix must be a boolean or "true"/"false" string');
+  }
+
+  if (
+    (payload.gpsLat !== undefined && payload.gpsLat !== null && gpsLat === null) ||
+    (payload.gpsLng !== undefined && payload.gpsLng !== null && gpsLng === null)
+  ) {
+    throw new Error("gpsLat and gpsLng must be valid numbers when provided");
+  }
+
   return {
     machineIdentifier,
     inputVoltage,
@@ -216,6 +254,10 @@ function normalizeTelemetryPayload(payload, topic) {
     igbtTemperature,
     heatSyncTemperature,
     arcOn,
+    gpsFix,
+    gpsLat,
+    gpsLng,
+    mapUrl,
     timestamp: parseTimestamp(payload.timestamp),
   };
 }
@@ -245,6 +287,10 @@ async function persistTelemetry(telemetry) {
       igbtTemperature: telemetry.igbtTemperature,
       heatSyncTemperature: telemetry.heatSyncTemperature,
       arcOn: telemetry.arcOn,
+      gpsFix: telemetry.gpsFix,
+      gpsLat: telemetry.gpsLat,
+      gpsLng: telemetry.gpsLng,
+      mapUrl: telemetry.mapUrl,
     },
   });
 

@@ -44,6 +44,10 @@ model Telemetry {
   igbtTemperature      Float?
   heatSyncTemperature  Float?
   arcOn         Boolean?
+  gpsFix        Boolean?
+  gpsLat        Float?
+  gpsLng        Float?
+  mapUrl        String?
   createdAt     DateTime @default(now())
   machine       Machine  @relation(fields: [machineId], references: [id])
 }
