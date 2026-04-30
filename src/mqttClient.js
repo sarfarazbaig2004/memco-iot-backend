@@ -15,6 +15,51 @@ const mqttState = {
   lastError: null,
 };
 
+function getErrorDetails(error) {
+  return {
+    name: error?.name,
+    code: error?.code,
+    message: error?.message || String(error),
+    meta: error?.meta,
+    stack: error?.stack,
+  };
+}
+
+function getPayloadKeys(payload) {
+  return payload && typeof payload === "object" && !Array.isArray(payload)
+    ? Object.keys(payload)
+    : [];
+}
+
+function truncateForLog(value, maxLength = 500) {
+  const text = String(value);
+
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function summarizeTelemetry(telemetry) {
+  if (!telemetry) {
+    return null;
+  }
+
+  return {
+    machineIdentifier: telemetry.machineIdentifier,
+    timestamp: telemetry.timestamp?.toISOString?.() || telemetry.timestamp,
+    inputVoltage: telemetry.inputVoltage,
+    outputVoltage: telemetry.outputVoltage,
+    outputCurrent: telemetry.outputCurrent,
+    temperature: telemetry.temperature,
+    trafoCoreTemperature: telemetry.trafoCoreTemperature,
+    igbtTemperature: telemetry.igbtTemperature,
+    heatSyncTemperature: telemetry.heatSyncTemperature,
+    arcOn: telemetry.arcOn,
+    gpsFix: telemetry.gpsFix,
+    gpsLat: telemetry.gpsLat,
+    gpsLng: telemetry.gpsLng,
+    hasMapUrl: Boolean(telemetry.mapUrl),
+  };
+}
+
 function parseNumber(value) {
   if (value === undefined || value === null || value === "") {
     return null;
@@ -69,6 +114,11 @@ async function findMachineByIdentifier(machineIdentifier) {
     ? Number.parseInt(machineIdentifier, 10)
     : null;
 
+  console.log("[mqtt] resolving machine identifier", {
+    machineIdentifier,
+    numericMachineId,
+  });
+
   if (Number.isInteger(numericMachineId) && numericMachineId > 0) {
     const machineById = await prisma.machine.findUnique({
       where: { id: numericMachineId },
@@ -76,14 +126,38 @@ async function findMachineByIdentifier(machineIdentifier) {
     });
 
     if (machineById) {
+      console.log("[mqtt] machine lookup matched by id", {
+        machineIdentifier,
+        machineId: machineById.id,
+        machineCode: machineById.machineCode,
+      });
       return machineById;
     }
+
+    console.warn("[mqtt] machine lookup by id returned no result", {
+      machineIdentifier,
+      numericMachineId,
+    });
   }
 
-  return prisma.machine.findFirst({
+  const machineByCode = await prisma.machine.findFirst({
     where: { machineCode: machineIdentifier },
     select: { id: true, machineCode: true },
   });
+
+  if (machineByCode) {
+    console.log("[mqtt] machine lookup matched by code", {
+      machineIdentifier,
+      machineId: machineByCode.id,
+      machineCode: machineByCode.machineCode,
+    });
+  } else {
+    console.warn("[mqtt] machine lookup by code returned no result", {
+      machineIdentifier,
+    });
+  }
+
+  return machineByCode;
 }
 
 function parseBoolean(value) {
@@ -118,6 +192,18 @@ function parseOptionalString(value) {
   const parsedValue = String(value).trim();
 
   return parsedValue || null;
+}
+
+function buildMapUrl(gpsLat, gpsLng, mapUrl) {
+  if (mapUrl) {
+    return mapUrl;
+  }
+
+  if (gpsLat === null || gpsLng === null) {
+    return null;
+  }
+
+  return `https://www.google.com/maps?q=${gpsLat},${gpsLng}`;
 }
 
 function parseTimestamp(value) {
@@ -157,6 +243,11 @@ function deriveTemperature(...temperatures) {
 }
 
 function normalizeTelemetryPayload(payload, topic) {
+  console.log("[mqtt] normalizing telemetry payload", {
+    topic,
+    payloadKeys: getPayloadKeys(payload),
+  });
+
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Payload must be a JSON object");
   }
@@ -194,10 +285,11 @@ function normalizeTelemetryPayload(payload, topic) {
     payload.heatSyncTemperature,
     payload.heatSinkTemperature
   );
-  const gpsFix = parseOptionalBoolean(payload.gpsFix);
+  const rawGpsFix = parseOptionalBoolean(payload.gpsFix);
   const gpsLat = parseNumber(payload.gpsLat);
   const gpsLng = parseNumber(payload.gpsLng);
-  const mapUrl = parseOptionalString(payload.mapUrl);
+  const mapUrl = buildMapUrl(gpsLat, gpsLng, parseOptionalString(payload.mapUrl));
+  const gpsFix = rawGpsFix ?? (gpsLat !== null && gpsLng !== null ? true : null);
   const temperature = getFirstValidNumber(
     payload.temperature,
     deriveTemperature(
@@ -232,7 +324,7 @@ function normalizeTelemetryPayload(payload, topic) {
     payload.gpsFix !== undefined &&
     payload.gpsFix !== null &&
     payload.gpsFix !== "" &&
-    gpsFix === null
+    rawGpsFix === null
   ) {
     throw new Error('gpsFix must be a boolean or "true"/"false" string');
   }
@@ -244,7 +336,7 @@ function normalizeTelemetryPayload(payload, topic) {
     throw new Error("gpsLat and gpsLng must be valid numbers when provided");
   }
 
-  return {
+  const telemetry = {
     machineIdentifier,
     inputVoltage,
     outputVoltage,
@@ -260,9 +352,16 @@ function normalizeTelemetryPayload(payload, topic) {
     mapUrl,
     timestamp: parseTimestamp(payload.timestamp),
   };
+
+  console.log("[mqtt] normalized telemetry payload", summarizeTelemetry(telemetry));
+
+  return telemetry;
 }
 
 async function persistTelemetry(telemetry) {
+  const startedAt = Date.now();
+  console.log("[mqtt] telemetry persistence started", summarizeTelemetry(telemetry));
+
   const machine = await findMachineByIdentifier(telemetry.machineIdentifier);
 
   if (!machine) {
@@ -274,6 +373,12 @@ async function persistTelemetry(telemetry) {
   console.log(
     `[mqtt] machine resolved ${telemetry.machineIdentifier} -> id ${machine.id}`
   );
+
+  console.log("[mqtt] creating telemetry row", {
+    machineId: machine.id,
+    machineCode: machine.machineCode,
+    telemetry: summarizeTelemetry(telemetry),
+  });
 
   const savedTelemetry = await prisma.telemetry.create({
     data: {
@@ -294,7 +399,25 @@ async function persistTelemetry(telemetry) {
     },
   });
 
+  console.log("[mqtt] telemetry row created", {
+    telemetryId: savedTelemetry.id,
+    machineId: savedTelemetry.machineId,
+    createdAt: savedTelemetry.createdAt,
+    elapsedMs: Date.now() - startedAt,
+  });
+
+  console.log("[mqtt] updating active welder session from telemetry", {
+    telemetryId: savedTelemetry.id,
+    machineId: savedTelemetry.machineId,
+  });
+
   await updateActiveWelderSessionFromTelemetry(savedTelemetry);
+
+  console.log("[mqtt] active welder session update completed", {
+    telemetryId: savedTelemetry.id,
+    machineId: savedTelemetry.machineId,
+    elapsedMs: Date.now() - startedAt,
+  });
 
   return {
     machine,
@@ -304,12 +427,23 @@ async function persistTelemetry(telemetry) {
 
 async function handleIncomingMessage(topic, message) {
   let payload;
+  const rawMessage = message.toString();
 
   try {
-    payload = JSON.parse(message.toString());
-    console.log(`[mqtt] MQTT received on ${topic}:`, payload);
-  } catch (_error) {
-    console.warn(`Ignoring non-JSON payload received on topic ${topic}`);
+    payload = JSON.parse(rawMessage);
+    console.log("[mqtt] MQTT received", {
+      topic,
+      byteLength: message.length,
+      payloadKeys: getPayloadKeys(payload),
+      machineIdentifier: parseMachineIdentifier(payload, topic),
+    });
+  } catch (error) {
+    console.warn("[mqtt] ignoring non-JSON payload", {
+      topic,
+      byteLength: message.length,
+      rawPreview: truncateForLog(rawMessage),
+      error: getErrorDetails(error),
+    });
     return;
   }
 
@@ -324,11 +458,21 @@ async function handleIncomingMessage(topic, message) {
     mqttState.lastError = error.message || String(error);
 
     if (String(error.message || "").startsWith("Machine not found")) {
-      console.error(`[mqtt] ${error.message}`);
+      console.error("[mqtt] machine lookup failed while processing telemetry", {
+        topic,
+        payloadKeys: getPayloadKeys(payload),
+        machineIdentifier: parseMachineIdentifier(payload, topic),
+        error: getErrorDetails(error),
+      });
       return;
     }
 
-    console.error(`[mqtt] failed to process message on ${topic}:`, error);
+    console.error("[mqtt] failed to process telemetry message", {
+      topic,
+      payloadKeys: getPayloadKeys(payload),
+      machineIdentifier: parseMachineIdentifier(payload, topic),
+      error: getErrorDetails(error),
+    });
   }
 }
 

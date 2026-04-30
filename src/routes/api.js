@@ -234,6 +234,18 @@ function parseOptionalString(value) {
   return parsedValue || null;
 }
 
+function buildMapUrl(gpsLat, gpsLng, mapUrl) {
+  if (mapUrl) {
+    return mapUrl;
+  }
+
+  if (gpsLat === null || gpsLng === null) {
+    return null;
+  }
+
+  return `https://www.google.com/maps?q=${gpsLat},${gpsLng}`;
+}
+
 function parseTimestamp(value) {
   if (!value) {
     return new Date();
@@ -510,13 +522,52 @@ function setFleetSummaryHeaders(res, summary) {
   });
 }
 
+function getErrorDetails(error) {
+  return {
+    name: error?.name,
+    code: error?.code,
+    message: error?.message || String(error),
+    meta: error?.meta,
+    stack: error?.stack,
+  };
+}
+
+function getPayloadKeys(payload) {
+  return payload && typeof payload === "object" && !Array.isArray(payload)
+    ? Object.keys(payload)
+    : [];
+}
+
+function summarizeTelemetryInput(telemetry) {
+  if (!telemetry) {
+    return null;
+  }
+
+  return {
+    machineIdentifier: telemetry.machineIdentifier,
+    timestamp: telemetry.timestamp?.toISOString?.() || telemetry.timestamp,
+    inputVoltage: telemetry.inputVoltage,
+    outputVoltage: telemetry.outputVoltage,
+    outputCurrent: telemetry.outputCurrent,
+    temperature: telemetry.temperature,
+    trafoCoreTemperature: telemetry.trafoCoreTemperature,
+    igbtTemperature: telemetry.igbtTemperature,
+    heatSyncTemperature: telemetry.heatSyncTemperature,
+    arcOn: telemetry.arcOn,
+    gpsFix: telemetry.gpsFix,
+    gpsLat: telemetry.gpsLat,
+    gpsLng: telemetry.gpsLng,
+    hasMapUrl: Boolean(telemetry.mapUrl),
+  };
+}
+
 function sendInternalError(context, error, res) {
-  console.error(`${context}:`, error);
+  console.error(context, getErrorDetails(error));
   res.status(500).json({ error: "Internal server error" });
 }
 
 function sendPrismaWriteError(context, error, res) {
-  console.error(`${context}:`, error);
+  console.error(context, getErrorDetails(error));
 
   if (error.code === "P2002") {
     return res.status(409).json({
@@ -1053,6 +1104,8 @@ router.post("/welders", async (req, res) => {
 });
 
 router.post("/telemetry", async (req, res) => {
+  const requestStartedAt = Date.now();
+
   try {
     const {
       machineId,
@@ -1073,9 +1126,17 @@ router.post("/telemetry", async (req, res) => {
       mapUrl,
     } = req.body;
 
+    console.log("[api] telemetry insert request received", {
+      payloadKeys: getPayloadKeys(req.body),
+      machineId,
+    });
+
     const machineIdentifier = parseMachineIdentifier(machineId);
 
     if (!machineIdentifier) {
+      console.warn("[api] telemetry insert rejected: missing machineId", {
+        payloadKeys: getPayloadKeys(req.body),
+      });
       return res.status(400).json({
         error: "machineId is required",
       });
@@ -1094,10 +1155,16 @@ router.post("/telemetry", async (req, res) => {
       parseOptionalNumber(heatSyncTemperature),
       parseOptionalNumber(heatSinkTemperature)
     );
-    const parsedGpsFix = parseOptionalBoolean(gpsFix);
+    const rawGpsFix = parseOptionalBoolean(gpsFix);
     const parsedGpsLat = parseOptionalNumber(gpsLat);
     const parsedGpsLng = parseOptionalNumber(gpsLng);
-    const parsedMapUrl = parseOptionalString(mapUrl);
+    const parsedMapUrl = buildMapUrl(
+      parsedGpsLat,
+      parsedGpsLng,
+      parseOptionalString(mapUrl)
+    );
+    const parsedGpsFix =
+      rawGpsFix ?? (parsedGpsLat !== null && parsedGpsLng !== null ? true : null);
     const parsedTemperature = firstPresentNumber(
       parseOptionalNumber(temperature),
       Math.max(
@@ -1111,6 +1178,10 @@ router.post("/telemetry", async (req, res) => {
     const parsedArcOn = parseOptionalBoolean(arcOn);
 
     if (!parsedTimestamp) {
+      console.warn("[api] telemetry insert rejected: invalid timestamp", {
+        machineIdentifier,
+        timestamp,
+      });
       return res.status(400).json({
         error: "Invalid timestamp format",
       });
@@ -1127,6 +1198,25 @@ router.post("/telemetry", async (req, res) => {
       Number.isNaN(parsedGpsLat) ||
       Number.isNaN(parsedGpsLng)
     ) {
+      console.warn("[api] telemetry insert rejected: invalid numeric value", {
+        machineIdentifier,
+        parsed: summarizeTelemetryInput({
+          machineIdentifier,
+          timestamp: parsedTimestamp,
+          inputVoltage: parsedInputVoltage,
+          outputVoltage: parsedOutputVoltage,
+          outputCurrent: parsedOutputCurrent,
+          temperature: parsedTemperature,
+          trafoCoreTemperature: parsedTrafoCoreTemperature,
+          igbtTemperature: parsedIgbtTemperature,
+          heatSyncTemperature: parsedHeatSyncTemperature,
+          arcOn: parsedArcOn,
+          gpsFix: parsedGpsFix,
+          gpsLat: parsedGpsLat,
+          gpsLng: parsedGpsLng,
+          mapUrl: parsedMapUrl,
+        }),
+      });
       return res.status(400).json({
         error:
           "Voltage, current, temperature, and GPS coordinate values must be valid numbers",
@@ -1139,6 +1229,10 @@ router.post("/telemetry", async (req, res) => {
       arcOn !== "" &&
       parsedArcOn === null
     ) {
+      console.warn("[api] telemetry insert rejected: invalid arcOn", {
+        machineIdentifier,
+        arcOn,
+      });
       return res.status(400).json({
         error: 'arcOn must be either true, false, "true", or "false"',
       });
@@ -1148,22 +1242,65 @@ router.post("/telemetry", async (req, res) => {
       gpsFix !== undefined &&
       gpsFix !== null &&
       gpsFix !== "" &&
-      parsedGpsFix === null
+      rawGpsFix === null
     ) {
+      console.warn("[api] telemetry insert rejected: invalid gpsFix", {
+        machineIdentifier,
+        gpsFix,
+      });
       return res.status(400).json({
         error: 'gpsFix must be either true, false, "true", or "false"',
       });
     }
+
+    const telemetryInput = {
+      machineIdentifier,
+      timestamp: parsedTimestamp,
+      inputVoltage: parsedInputVoltage,
+      outputVoltage: parsedOutputVoltage,
+      outputCurrent: parsedOutputCurrent,
+      temperature: parsedTemperature,
+      trafoCoreTemperature: parsedTrafoCoreTemperature,
+      igbtTemperature: parsedIgbtTemperature,
+      heatSyncTemperature: parsedHeatSyncTemperature,
+      arcOn: parsedArcOn,
+      gpsFix: parsedGpsFix,
+      gpsLat: parsedGpsLat,
+      gpsLng: parsedGpsLng,
+      mapUrl: parsedMapUrl,
+    };
+
+    console.log("[api] telemetry insert payload parsed", {
+      telemetry: summarizeTelemetryInput(telemetryInput),
+    });
+
+    console.log("[api] resolving machine for telemetry insert", {
+      machineIdentifier,
+    });
 
     const machine = await findMachineByIdentifier(machineIdentifier, {
       select: { id: true },
     });
 
     if (!machine) {
+      console.warn("[api] telemetry insert rejected: machine not found", {
+        machineIdentifier,
+        elapsedMs: Date.now() - requestStartedAt,
+      });
       return res.status(404).json({
         error: `Machine with identifier ${machineIdentifier} not found`,
       });
     }
+
+    console.log("[api] machine resolved for telemetry insert", {
+      machineIdentifier,
+      machineId: machine.id,
+    });
+
+    console.log("[api] creating telemetry row", {
+      machineId: machine.id,
+      telemetry: summarizeTelemetryInput(telemetryInput),
+    });
 
     const telemetry = await prisma.telemetry.create({
       data: {
@@ -1184,7 +1321,20 @@ router.post("/telemetry", async (req, res) => {
       },
     });
 
+    console.log("[api] telemetry row created", {
+      telemetryId: telemetry.id,
+      machineId: telemetry.machineId,
+      createdAt: telemetry.createdAt,
+      elapsedMs: Date.now() - requestStartedAt,
+    });
+
     await updateActiveWelderSessionFromTelemetry(telemetry);
+
+    console.log("[api] active welder session update completed", {
+      telemetryId: telemetry.id,
+      machineId: telemetry.machineId,
+      elapsedMs: Date.now() - requestStartedAt,
+    });
 
     return res.json({
       message: "Telemetry inserted successfully",
@@ -1196,6 +1346,11 @@ router.post("/telemetry", async (req, res) => {
           : null,
     });
   } catch (error) {
+    console.error("[api] telemetry insert failed", {
+      payloadKeys: getPayloadKeys(req.body),
+      elapsedMs: Date.now() - requestStartedAt,
+      error: getErrorDetails(error),
+    });
     return sendPrismaWriteError("Telemetry insert error", error, res);
   }
 });
