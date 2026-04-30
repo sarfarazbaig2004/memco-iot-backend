@@ -30,6 +30,9 @@ model Machine {
   telemetry    Telemetry[]
   welderSessions WelderSession[]
   userAccesses UserMachineAccess[]
+  latestTelemetry MachineLatestTelemetry?
+  productionEvents MachineProductionEvent[]
+  dailyProductionSummaries DailyProductionSummary[]
 }
 
 model Telemetry {
@@ -43,6 +46,7 @@ model Telemetry {
   trafoCoreTemperature Float?
   igbtTemperature      Float?
   heatSyncTemperature  Float?
+  machineOn     Boolean?
   arcOn         Boolean?
   gpsFix        Boolean?
   gpsLat        Float?
@@ -50,6 +54,68 @@ model Telemetry {
   mapUrl        String?
   createdAt     DateTime @default(now())
   machine       Machine  @relation(fields: [machineId], references: [id])
+}
+
+model MachineLatestTelemetry {
+  id            Int      @id @default(autoincrement())
+  machineId     Int      @unique
+  timestamp     DateTime
+  inputVoltage  Float?
+  outputVoltage Float?
+  outputCurrent Float?
+  temperature   Float?
+  trafoCoreTemperature Float?
+  igbtTemperature      Float?
+  heatSyncTemperature  Float?
+  machineOn     Boolean?
+  arcOn         Boolean?
+  state         String
+  gpsFix        Boolean?
+  gpsLat        Float?
+  gpsLng        Float?
+  mapUrl        String?
+  telemetryId   Int?
+  lastReceivedAt DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  machine       Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@index([state])
+  @@index([timestamp])
+}
+
+model MachineProductionEvent {
+  id              Int       @id @default(autoincrement())
+  machineId       Int
+  state           String
+  startTime       DateTime
+  endTime         DateTime?
+  durationSeconds Int?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  machine         Machine   @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@index([machineId, startTime])
+  @@index([machineId, state])
+  @@index([machineId, endTime])
+}
+
+model DailyProductionSummary {
+  id               Int      @id @default(autoincrement())
+  machineId        Int
+  date             DateTime
+  arcSeconds       Int      @default(0)
+  idleSeconds      Int      @default(0)
+  offSeconds       Int      @default(0)
+  offlineSeconds   Int      @default(0)
+  machineOnSeconds Int      @default(0)
+  noOfArcs         Int      @default(0)
+  lastUpdatedAt    DateTime @default(now())
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  machine          Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@unique([machineId, date])
+  @@index([date])
 }
 
 model Welder {

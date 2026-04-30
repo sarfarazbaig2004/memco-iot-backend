@@ -9,10 +9,16 @@ const {
 const {
   updateActiveWelderSessionFromTelemetry,
 } = require("../welderSessions");
+const {
+  getDailyProductionSummary,
+  getProductionTimeline,
+  parseProductionDate,
+  processTelemetryForProduction,
+} = require("../productionTelemetry");
 
 const router = express.Router();
 
-const TELEMETRY_FRESHNESS_SECONDS = 180;
+const TELEMETRY_FRESHNESS_SECONDS = 5 * 60;
 const DEFAULT_CURRENT_SETTING = 0;
 const MODULE_KEYS = [
   "fleet",
@@ -294,6 +300,10 @@ function getMachineStatus(telemetry) {
     return "OFFLINE";
   }
 
+  if (telemetry.machineOn === false) {
+    return "OFF";
+  }
+
   if (telemetry.arcOn === true || Number(telemetry.outputCurrent) > 20) {
     return "WELDING";
   }
@@ -441,6 +451,7 @@ function buildZeroTelemetryData(machineId) {
     trafoCoreTemperature: 0,
     igbtTemperature: 0,
     heatSyncTemperature: 0,
+    machineOn: false,
     arcOn: false,
     gpsFix: null,
     gpsLat: null,
@@ -553,6 +564,7 @@ function summarizeTelemetryInput(telemetry) {
     trafoCoreTemperature: telemetry.trafoCoreTemperature,
     igbtTemperature: telemetry.igbtTemperature,
     heatSyncTemperature: telemetry.heatSyncTemperature,
+    machineOn: telemetry.machineOn,
     arcOn: telemetry.arcOn,
     gpsFix: telemetry.gpsFix,
     gpsLat: telemetry.gpsLat,
@@ -1119,6 +1131,7 @@ router.post("/telemetry", async (req, res) => {
       igbtTemperature,
       heatSyncTemperature,
       heatSinkTemperature,
+      machineOn,
       arcOn,
       gpsFix,
       gpsLat,
@@ -1155,6 +1168,7 @@ router.post("/telemetry", async (req, res) => {
       parseOptionalNumber(heatSyncTemperature),
       parseOptionalNumber(heatSinkTemperature)
     );
+    const parsedMachineOn = parseOptionalBoolean(machineOn);
     const rawGpsFix = parseOptionalBoolean(gpsFix);
     const parsedGpsLat = parseOptionalNumber(gpsLat);
     const parsedGpsLng = parseOptionalNumber(gpsLng);
@@ -1210,6 +1224,7 @@ router.post("/telemetry", async (req, res) => {
           trafoCoreTemperature: parsedTrafoCoreTemperature,
           igbtTemperature: parsedIgbtTemperature,
           heatSyncTemperature: parsedHeatSyncTemperature,
+          machineOn: parsedMachineOn,
           arcOn: parsedArcOn,
           gpsFix: parsedGpsFix,
           gpsLat: parsedGpsLat,
@@ -1220,6 +1235,21 @@ router.post("/telemetry", async (req, res) => {
       return res.status(400).json({
         error:
           "Voltage, current, temperature, and GPS coordinate values must be valid numbers",
+      });
+    }
+
+    if (
+      machineOn !== undefined &&
+      machineOn !== null &&
+      machineOn !== "" &&
+      parsedMachineOn === null
+    ) {
+      console.warn("[api] telemetry insert rejected: invalid machineOn", {
+        machineIdentifier,
+        machineOn,
+      });
+      return res.status(400).json({
+        error: 'machineOn must be either true, false, "true", or "false"',
       });
     }
 
@@ -1263,6 +1293,7 @@ router.post("/telemetry", async (req, res) => {
       trafoCoreTemperature: parsedTrafoCoreTemperature,
       igbtTemperature: parsedIgbtTemperature,
       heatSyncTemperature: parsedHeatSyncTemperature,
+      machineOn: parsedMachineOn,
       arcOn: parsedArcOn,
       gpsFix: parsedGpsFix,
       gpsLat: parsedGpsLat,
@@ -1313,6 +1344,7 @@ router.post("/telemetry", async (req, res) => {
         trafoCoreTemperature: parsedTrafoCoreTemperature,
         igbtTemperature: parsedIgbtTemperature,
         heatSyncTemperature: parsedHeatSyncTemperature,
+        machineOn: parsedMachineOn,
         arcOn: parsedArcOn,
         gpsFix: parsedGpsFix,
         gpsLat: parsedGpsLat,
@@ -1329,10 +1361,12 @@ router.post("/telemetry", async (req, res) => {
     });
 
     await updateActiveWelderSessionFromTelemetry(telemetry);
+    const productionResult = await processTelemetryForProduction(telemetry);
 
     console.log("[api] active welder session update completed", {
       telemetryId: telemetry.id,
       machineId: telemetry.machineId,
+      productionState: productionResult.state,
       elapsedMs: Date.now() - requestStartedAt,
     });
 
@@ -1746,6 +1780,93 @@ router.get("/machine/:id/latest", async (req, res) => {
   }
 });
 
+router.get("/machine/:id/production/daily", async (req, res) => {
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
+
+    if (!machineIdentifier) {
+      return res.status(400).json({
+        error: "Machine identifier is required",
+      });
+    }
+
+    const productionDate = parseProductionDate(req.query.date);
+
+    if (!productionDate) {
+      return res.status(400).json({
+        error: "date query parameter must use YYYY-MM-DD",
+      });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: { id: true, machineCode: true },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
+      });
+    }
+
+    if (!(await canAccessMachine(req.user, machine.id))) {
+      return res.status(403).json({
+        error: "Machine access denied",
+      });
+    }
+
+    const summary = await getDailyProductionSummary(machine.id, productionDate);
+
+    return res.json({
+      ...summary,
+      machineCode: machine.machineCode,
+    });
+  } catch (error) {
+    return sendInternalError("Daily production summary error", error, res);
+  }
+});
+
+router.get("/machine/:id/production/timeline", async (req, res) => {
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
+
+    if (!machineIdentifier) {
+      return res.status(400).json({
+        error: "Machine identifier is required",
+      });
+    }
+
+    const productionDate = parseProductionDate(req.query.date);
+
+    if (!productionDate) {
+      return res.status(400).json({
+        error: "date query parameter must use YYYY-MM-DD",
+      });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: { id: true },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
+      });
+    }
+
+    if (!(await canAccessMachine(req.user, machine.id))) {
+      return res.status(403).json({
+        error: "Machine access denied",
+      });
+    }
+
+    const events = await getProductionTimeline(machine.id, productionDate);
+
+    return res.json(events);
+  } catch (error) {
+    return sendInternalError("Production timeline error", error, res);
+  }
+});
+
 router.get("/machine/:id/overview", async (req, res) => {
   try {
     const machineIdentifier = parseMachineIdentifier(req.params.id);
@@ -1899,6 +2020,7 @@ router.get("/machines/overview", async (req, res) => {
             trafoCoreTemperature: true,
             igbtTemperature: true,
             heatSyncTemperature: true,
+            machineOn: true,
             gpsFix: true,
             gpsLat: true,
             gpsLng: true,

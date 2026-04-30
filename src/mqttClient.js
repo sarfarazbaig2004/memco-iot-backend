@@ -4,6 +4,9 @@ const config = require("./config");
 const {
   updateActiveWelderSessionFromTelemetry,
 } = require("./welderSessions");
+const {
+  processTelemetryForProduction,
+} = require("./productionTelemetry");
 
 let client = null;
 let demoTelemetryInterval = null;
@@ -52,6 +55,7 @@ function summarizeTelemetry(telemetry) {
     trafoCoreTemperature: telemetry.trafoCoreTemperature,
     igbtTemperature: telemetry.igbtTemperature,
     heatSyncTemperature: telemetry.heatSyncTemperature,
+    machineOn: telemetry.machineOn,
     arcOn: telemetry.arcOn,
     gpsFix: telemetry.gpsFix,
     gpsLat: telemetry.gpsLat,
@@ -299,6 +303,7 @@ function normalizeTelemetryPayload(payload, topic) {
     )
   );
   const arcOn = parseBoolean(payload.arcOn);
+  const machineOn = parseOptionalBoolean(payload.machineOn);
 
   if (inputVoltage === null) {
     throw new Error("inputVoltage must be a valid number");
@@ -318,6 +323,15 @@ function normalizeTelemetryPayload(payload, topic) {
 
   if (arcOn === null) {
     throw new Error('arcOn must be a boolean or "true"/"false" string');
+  }
+
+  if (
+    payload.machineOn !== undefined &&
+    payload.machineOn !== null &&
+    payload.machineOn !== "" &&
+    machineOn === null
+  ) {
+    throw new Error('machineOn must be a boolean or "true"/"false" string');
   }
 
   if (
@@ -345,6 +359,7 @@ function normalizeTelemetryPayload(payload, topic) {
     trafoCoreTemperature,
     igbtTemperature,
     heatSyncTemperature,
+    machineOn,
     arcOn,
     gpsFix,
     gpsLat,
@@ -391,6 +406,7 @@ async function persistTelemetry(telemetry) {
       trafoCoreTemperature: telemetry.trafoCoreTemperature,
       igbtTemperature: telemetry.igbtTemperature,
       heatSyncTemperature: telemetry.heatSyncTemperature,
+      machineOn: telemetry.machineOn,
       arcOn: telemetry.arcOn,
       gpsFix: telemetry.gpsFix,
       gpsLat: telemetry.gpsLat,
@@ -412,10 +428,12 @@ async function persistTelemetry(telemetry) {
   });
 
   await updateActiveWelderSessionFromTelemetry(savedTelemetry);
+  const productionResult = await processTelemetryForProduction(savedTelemetry);
 
   console.log("[mqtt] active welder session update completed", {
     telemetryId: savedTelemetry.id,
     machineId: savedTelemetry.machineId,
+    productionState: productionResult.state,
     elapsedMs: Date.now() - startedAt,
   });
 
