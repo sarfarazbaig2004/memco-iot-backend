@@ -7,77 +7,85 @@ datasource db {
 }
 
 model Company {
-  id        Int       @id @default(autoincrement())
+  id        Int        @id @default(autoincrement())
   name      String
-  code      String    @unique
+  code      String     @unique
   email     String?
   mobile    String?
-  createdAt DateTime  @default(now())
+  createdAt DateTime   @default(now())
+  customers Customer[]
   machines  Machine[]
+  users     User[]
 }
 
 model Machine {
-  id           Int         @id @default(autoincrement())
-  companyId    Int
-  machineCode  String
-  model        String
-  machineType  String
-  location     String?
-  status       String      @default("ACTIVE")
-  createdAt    DateTime    @default(now())
-  serialNumber String?     @unique
-  company      Company     @relation(fields: [companyId], references: [id])
-  telemetry    Telemetry[]
-  welderSessions WelderSession[]
-  userAccesses UserMachineAccess[]
-  latestTelemetry MachineLatestTelemetry?
-  productionEvents MachineProductionEvent[]
+  id                       Int                      @id @default(autoincrement())
+  companyId                Int
+  machineCode              String
+  model                    String
+  machineType              MachineType              @default(SINGLE_PHASE)
+  location                 String?
+  status                   String                   @default("ACTIVE")
+  createdAt                DateTime                 @default(now())
+  serialNumber             String?                  @unique
+  inputVoltageMode         InputVoltageMode         @default(SINGLE)
+  showPhaseVoltageR        Boolean                  @default(false)
+  showPhaseVoltageY        Boolean                  @default(false)
+  showPhaseVoltageB        Boolean                  @default(false)
+  showInputVoltageSingle   Boolean                  @default(true)
+  CustomerMachineAccess    CustomerMachineAccess[]
   dailyProductionSummaries DailyProductionSummary[]
+  company                  Company                  @relation(fields: [companyId], references: [id])
+  latestTelemetry          MachineLatestTelemetry?
+  productionEvents         MachineProductionEvent[]
+  telemetry                Telemetry[]
+  userAccesses             UserMachineAccess[]
+  welderSessions           WelderSession[]
 }
 
 model Telemetry {
-  id            Int      @id @default(autoincrement())
-  machineId     Int
-  timestamp     DateTime
-  inputVoltage  Float?
-  outputVoltage Float?
-  outputCurrent Float?
-  temperature   Float?
+  id                   Int      @id @default(autoincrement())
+  machineId            Int
+  timestamp            DateTime
+  inputVoltage         Float?
+  outputVoltage        Float?
+  outputCurrent        Float?
+  temperature          Float?
+  arcOn                Boolean?
+  createdAt            DateTime @default(now())
   trafoCoreTemperature Float?
   igbtTemperature      Float?
   heatSyncTemperature  Float?
-  machineOn     Boolean?
-  arcOn         Boolean?
-  gpsFix        Boolean?
-  gpsLat        Float?
-  gpsLng        Float?
-  mapUrl        String?
-  createdAt     DateTime @default(now())
-  machine       Machine  @relation(fields: [machineId], references: [id])
+  gpsFix               Boolean?
+  gpsLat               Float?
+  gpsLng               Float?
+  mapUrl               String?
+  machineOn            Boolean?
+  machine              Machine  @relation(fields: [machineId], references: [id])
 }
 
 model MachineLatestTelemetry {
-  id            Int      @id @default(autoincrement())
-  machineId     Int      @unique
-  timestamp     DateTime
-  inputVoltage  Float?
-  outputVoltage Float?
-  outputCurrent Float?
-  temperature   Float?
+  id                   Int      @id @default(autoincrement())
+  machineId            Int      @unique
+  timestamp            DateTime
+  inputVoltage         Float?
+  outputVoltage        Float?
+  outputCurrent        Float?
+  temperature          Float?
   trafoCoreTemperature Float?
   igbtTemperature      Float?
   heatSyncTemperature  Float?
-  machineOn     Boolean?
-  arcOn         Boolean?
-  state         String
-  gpsFix        Boolean?
-  gpsLat        Float?
-  gpsLng        Float?
-  mapUrl        String?
-  telemetryId   Int?
-  lastReceivedAt DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  machine       Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  machineOn            Boolean?
+  arcOn                Boolean?
+  state                String
+  gpsFix               Boolean?
+  gpsLat               Float?
+  gpsLng               Float?
+  mapUrl               String?
+  telemetryId          Int?
+  lastReceivedAt       DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  machine              Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
 
   @@index([state])
   @@index([timestamp])
@@ -128,22 +136,22 @@ model Welder {
 }
 
 model WelderSession {
-  id                 Int       @id @default(autoincrement())
-  welderId           Int
-  machineId          Int
-  rfidCardNo          String
-  startedAt           DateTime  @default(now())
-  endedAt             DateTime?
-  status              String    @default("ACTIVE")
-  arcingTimeSeconds   Int       @default(0)
-  idleTimeSeconds     Int       @default(0)
-  lastTelemetryAt     DateTime?
-  energy              Float     @default(0)
-  deposition          Float     @default(0)
-  arcCount            Int       @default(0)
-  lastArcOn           Boolean   @default(false)
-  welder              Welder    @relation(fields: [welderId], references: [id])
-  machine             Machine   @relation(fields: [machineId], references: [id])
+  id                Int       @id @default(autoincrement())
+  welderId          Int
+  machineId         Int
+  rfidCardNo        String
+  startedAt         DateTime  @default(now())
+  endedAt           DateTime?
+  status            String    @default("ACTIVE")
+  arcingTimeSeconds Int       @default(0)
+  idleTimeSeconds   Int       @default(0)
+  lastTelemetryAt   DateTime?
+  energy            Float     @default(0)
+  deposition        Float     @default(0)
+  arcCount          Int       @default(0)
+  lastArcOn         Boolean   @default(false)
+  machine           Machine   @relation(fields: [machineId], references: [id])
+  welder            Welder    @relation(fields: [welderId], references: [id])
 
   @@index([machineId, status])
   @@index([welderId, status])
@@ -151,15 +159,49 @@ model WelderSession {
 }
 
 model User {
-  id           Int      @id @default(autoincrement())
-  name         String
-  email        String   @unique
-  passwordHash String
-  role         String   @default("CUSTOMER")
-  active       Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  moduleAccesses UserModuleAccess[]
+  id              Int                 @id @default(autoincrement())
+  name            String
+  email           String              @unique
+  passwordHash    String
+  role            Role                @default(CUSTOMER)
+  active          Boolean             @default(true)
+  createdAt       DateTime            @default(now())
+  companyId       Int?
+  customer        Customer?
+  company         Company?            @relation(fields: [companyId], references: [id])
   machineAccesses UserMachineAccess[]
+  moduleAccesses  UserModuleAccess[]
+}
+
+model Customer {
+  id                      Int                       @id @default(autoincrement())
+  companyId               Int
+  userId                  Int                       @unique
+  name                    String
+  email                   String                    @unique
+  active                  Boolean                   @default(true)
+  createdAt               DateTime                  @default(now())
+  updatedAt               DateTime
+  company                 Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user                    User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  CustomerFeatureAccess   CustomerFeatureAccess[]
+  machineAccess           CustomerMachineAccess[]
+  CustomerModuleAccess    CustomerModuleAccess[]
+  CustomerParameterAccess CustomerParameterAccess[]
+
+  @@index([companyId])
+}
+
+model CustomerMachineAccess {
+  id         Int      @id @default(autoincrement())
+  customerId Int
+  machineId  Int
+  createdAt  DateTime @default(now())
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  Machine    Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, machineId])
+  @@index([machineId])
 }
 
 model UserModuleAccess {
@@ -180,9 +222,65 @@ model UserMachineAccess {
   userId    Int
   machineId Int
   createdAt DateTime @default(now())
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   machine   Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, machineId])
   @@index([machineId])
+}
+
+model CustomerFeatureAccess {
+  id         Int      @id @default(autoincrement())
+  customerId Int
+  featureKey String
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime
+  Customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, featureKey])
+  @@index([featureKey])
+}
+
+model CustomerModuleAccess {
+  id         Int      @id @default(autoincrement())
+  customerId Int
+  moduleKey  String
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime
+  Customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, moduleKey])
+  @@index([moduleKey])
+}
+
+model CustomerParameterAccess {
+  id           Int      @id @default(autoincrement())
+  customerId   Int
+  parameterKey String
+  enabled      Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime
+  Customer     Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, parameterKey])
+  @@index([parameterKey])
+}
+
+enum Role {
+  SOFTWARE_SUPER_ADMIN
+  COMPANY_SUPER_ADMIN
+  CUSTOMER
+}
+
+enum MachineType {
+  SINGLE_PHASE
+  THREE_PHASE
+}
+
+enum InputVoltageMode {
+  SINGLE
+  THREE_PHASE
+  HIDDEN
 }
