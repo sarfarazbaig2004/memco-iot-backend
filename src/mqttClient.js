@@ -47,6 +47,7 @@ function summarizeTelemetry(telemetry) {
 
   return {
     machineIdentifier: telemetry.machineIdentifier,
+    isGpsOnly: telemetry.isGpsOnly,
     timestamp: telemetry.timestamp?.toISOString?.() || telemetry.timestamp,
     inputVoltage: telemetry.inputVoltage,
     outputVoltage: telemetry.outputVoltage,
@@ -93,24 +94,44 @@ function parseMachineIdentifierFromTopic(topic) {
 }
 
 function parseMachineIdentifier(payload, topic) {
-  const hasMachineCode =
-    hasOwnValue(payload, "machineCode") &&
+  // 🔴 TEMP FIX FOR BARODA MACHINE (5 days only)
+  if (topic === "machine/data/M_data") {
+    console.log("[mqtt] TEMP mapping M_data → WM-001");
+    return "WM-001"; // 👈 change if your machine code is different
+  }
+
+  // ✅ Priority 1: machineCode from payload
+  if (
+    payload &&
     payload.machineCode !== undefined &&
     payload.machineCode !== null &&
-    String(payload.machineCode).trim() !== "";
-  const rawIdentifier = hasMachineCode
-    ? payload.machineCode
-    : payload.machineId;
+    String(payload.machineCode).trim() !== ""
+  ) {
+    return String(payload.machineCode).trim();
+  }
 
-  if (rawIdentifier !== undefined && rawIdentifier !== null) {
-    const machineIdentifier = String(rawIdentifier).trim();
+  // ✅ Priority 2: machineId from payload
+  if (
+    payload &&
+    payload.machineId !== undefined &&
+    payload.machineId !== null
+  ) {
+    return String(payload.machineId).trim();
+  }
 
-    if (machineIdentifier) {
-      return machineIdentifier;
+  // ✅ Priority 3: topic-based extraction (normal flow)
+  const topicPrefix = "machine/data/";
+
+  if (typeof topic === "string" && topic.startsWith(topicPrefix)) {
+    const identifier = topic.slice(topicPrefix.length).trim();
+
+    if (identifier && !identifier.includes("/")) {
+      return identifier;
     }
   }
 
-  return parseMachineIdentifierFromTopic(topic);
+  // ❌ If nothing works
+  return null;
 }
 
 async function findMachineByIdentifier(machineIdentifier) {
@@ -246,6 +267,49 @@ function deriveTemperature(...temperatures) {
   return Math.max(...validTemperatures);
 }
 
+function hasTelemetryField(payload, fields) {
+  return fields.some((field) => {
+    const value = payload[field];
+
+    return value !== undefined && value !== null && value !== "";
+  });
+}
+
+function hasGpsPayload(payload) {
+  return hasTelemetryField(payload, ["gpsLat", "gpsLng", "lat", "lon"]);
+}
+
+function hasWeldingPayload(payload) {
+  return hasTelemetryField(payload, [
+    "inputVoltage",
+    "outputVoltage",
+    "outputCurrent",
+    "temperature",
+    "trafoCoreTemperature",
+    "transformerCoreTemperature",
+    "igbtTemperature",
+    "heatSyncTemperature",
+    "heatSinkTemperature",
+    "arcOn",
+  ]);
+}
+
+function parseDateTimePayload(payload) {
+  const datePart = parseOptionalString(payload.Date);
+  const timePart = parseOptionalString(payload.Time);
+  const combinedDateTime = parseOptionalString(payload.time_date);
+
+  if (combinedDateTime) {
+    return combinedDateTime;
+  }
+
+  if (datePart && timePart) {
+    return `${datePart} ${timePart}`;
+  }
+
+  return payload.timestamp;
+}
+
 function normalizeTelemetryPayload(payload, topic) {
   console.log("[mqtt] normalizing telemetry payload", {
     topic,
@@ -255,21 +319,29 @@ function normalizeTelemetryPayload(payload, topic) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Payload must be a JSON object");
   }
+  const normalizedPayload = { ...payload };
 
-  const requiredFields = [
-    "inputVoltage",
-    "outputVoltage",
-    "outputCurrent",
-    "arcOn",
-  ];
+  if (Array.isArray(normalizedPayload.readings)) {
+    const readings = normalizedPayload.readings;
 
-  for (const field of requiredFields) {
-    if (!hasOwnValue(payload, field)) {
-      throw new Error(`Missing required telemetry field: ${field}`);
-    }
+    normalizedPayload.machineCode = normalizedPayload.machineCode || "WM-001";
+
+    normalizedPayload.inputVoltage =
+      normalizedPayload.inputVoltage ?? parseNumber(readings[9]);
+    normalizedPayload.outputVoltage =
+      normalizedPayload.outputVoltage ?? parseNumber(readings[5]);
+    normalizedPayload.outputCurrent =
+      normalizedPayload.outputCurrent ?? parseNumber(readings[3]);
+    normalizedPayload.temperature =
+      normalizedPayload.temperature ?? parseNumber(readings[0]);
   }
 
-  const machineIdentifier = parseMachineIdentifier(payload, topic);
+  normalizedPayload.gpsLat =
+    normalizedPayload.gpsLat ?? parseNumber(normalizedPayload.lat);
+  normalizedPayload.gpsLng =
+    normalizedPayload.gpsLng ?? parseNumber(normalizedPayload.lon);
+
+  const machineIdentifier = parseMachineIdentifier(normalizedPayload, topic);
 
   if (!machineIdentifier) {
     throw new Error(
@@ -277,81 +349,87 @@ function normalizeTelemetryPayload(payload, topic) {
     );
   }
 
-  const inputVoltage = parseNumber(payload.inputVoltage);
-  const outputVoltage = parseNumber(payload.outputVoltage);
-  const outputCurrent = parseNumber(payload.outputCurrent);
+  const inputVoltage = parseNumber(normalizedPayload.inputVoltage);
+  const outputVoltage = parseNumber(normalizedPayload.outputVoltage);
+  const outputCurrent = parseNumber(normalizedPayload.outputCurrent);
   const trafoCoreTemperature = getFirstValidNumber(
-    payload.trafoCoreTemperature,
-    payload.transformerCoreTemperature
+    normalizedPayload.trafoCoreTemperature,
+    normalizedPayload.transformerCoreTemperature
   );
-  const igbtTemperature = parseNumber(payload.igbtTemperature);
+  const igbtTemperature = parseNumber(normalizedPayload.igbtTemperature);
   const heatSyncTemperature = getFirstValidNumber(
-    payload.heatSyncTemperature,
-    payload.heatSinkTemperature
+    normalizedPayload.heatSyncTemperature,
+    normalizedPayload.heatSinkTemperature
   );
-  const rawGpsFix = parseOptionalBoolean(payload.gpsFix);
-  const gpsLat = parseNumber(payload.gpsLat);
-  const gpsLng = parseNumber(payload.gpsLng);
-  const mapUrl = buildMapUrl(gpsLat, gpsLng, parseOptionalString(payload.mapUrl));
+  const rawGpsFix = parseOptionalBoolean(normalizedPayload.gpsFix);
+  const gpsLat = parseNumber(normalizedPayload.gpsLat);
+  const gpsLng = parseNumber(normalizedPayload.gpsLng);
+  const mapUrl = buildMapUrl(
+    gpsLat,
+    gpsLng,
+    parseOptionalString(normalizedPayload.mapUrl)
+  );
   const gpsFix = rawGpsFix ?? (gpsLat !== null && gpsLng !== null ? true : null);
   const temperature = getFirstValidNumber(
-    payload.temperature,
+    normalizedPayload.temperature,
     deriveTemperature(
       trafoCoreTemperature,
       igbtTemperature,
       heatSyncTemperature
     )
   );
-  const arcOn = parseBoolean(payload.arcOn);
-  const machineOn = parseOptionalBoolean(payload.machineOn);
+  const arcOn =
+    normalizedPayload.arcOn === undefined || normalizedPayload.arcOn === null
+      ? outputCurrent !== null
+        ? outputCurrent > 10
+        : null
+      : parseBoolean(normalizedPayload.arcOn);
+  const machineOn =
+    normalizedPayload.machineOn === undefined || normalizedPayload.machineOn === null
+      ? inputVoltage !== null
+        ? inputVoltage > 50
+        : null
+      : parseOptionalBoolean(normalizedPayload.machineOn);
+  const containsWeldingData = hasWeldingPayload(normalizedPayload);
+  const containsGpsData = hasGpsPayload(normalizedPayload);
+  const isGpsOnly = containsGpsData && !containsWeldingData;
 
-  if (inputVoltage === null) {
-    throw new Error("inputVoltage must be a valid number");
-  }
-
-  if (outputVoltage === null) {
-    throw new Error("outputVoltage must be a valid number");
-  }
-
-  if (outputCurrent === null) {
-    throw new Error("outputCurrent must be a valid number");
-  }
-
-  if (temperature === null) {
-    throw new Error("temperature must be a valid number");
-  }
-
-  if (arcOn === null) {
+  if (containsWeldingData && arcOn === null) {
     throw new Error('arcOn must be a boolean or "true"/"false" string');
   }
 
   if (
-    payload.machineOn !== undefined &&
-    payload.machineOn !== null &&
-    payload.machineOn !== "" &&
+    normalizedPayload.machineOn !== undefined &&
+    normalizedPayload.machineOn !== null &&
+    normalizedPayload.machineOn !== "" &&
     machineOn === null
   ) {
     throw new Error('machineOn must be a boolean or "true"/"false" string');
   }
 
   if (
-    payload.gpsFix !== undefined &&
-    payload.gpsFix !== null &&
-    payload.gpsFix !== "" &&
+    normalizedPayload.gpsFix !== undefined &&
+    normalizedPayload.gpsFix !== null &&
+    normalizedPayload.gpsFix !== "" &&
     rawGpsFix === null
   ) {
     throw new Error('gpsFix must be a boolean or "true"/"false" string');
   }
 
   if (
-    (payload.gpsLat !== undefined && payload.gpsLat !== null && gpsLat === null) ||
-    (payload.gpsLng !== undefined && payload.gpsLng !== null && gpsLng === null)
+    (normalizedPayload.gpsLat !== undefined &&
+      normalizedPayload.gpsLat !== null &&
+      gpsLat === null) ||
+    (normalizedPayload.gpsLng !== undefined &&
+      normalizedPayload.gpsLng !== null &&
+      gpsLng === null)
   ) {
     throw new Error("gpsLat and gpsLng must be valid numbers when provided");
   }
 
   const telemetry = {
     machineIdentifier,
+    isGpsOnly,
     inputVoltage,
     outputVoltage,
     outputCurrent,
@@ -365,7 +443,7 @@ function normalizeTelemetryPayload(payload, topic) {
     gpsLat,
     gpsLng,
     mapUrl,
-    timestamp: parseTimestamp(payload.timestamp),
+    timestamp: parseTimestamp(parseDateTimePayload(normalizedPayload)),
   };
 
   console.log("[mqtt] normalized telemetry payload", summarizeTelemetry(telemetry));
@@ -467,6 +545,14 @@ async function handleIncomingMessage(topic, message) {
 
   try {
     const telemetry = normalizeTelemetryPayload(payload, topic);
+
+    if (telemetry.isGpsOnly) {
+      console.log("[mqtt] GPS-only payload normalized; skipping welding telemetry save", {
+        topic,
+        telemetry: summarizeTelemetry(telemetry),
+      });
+      return;
+    }
 
     const result = await persistTelemetry(telemetry);
     console.log(
