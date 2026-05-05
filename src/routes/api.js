@@ -131,6 +131,44 @@ async function canAccessMachine(user, machineId) {
   return allowedMachineIds === null || allowedMachineIds.includes(machineId);
 }
 
+async function getAccessUser(req) {
+  const email = req.headers["x-user-email"];
+
+  if (!email) {
+    return null;
+  }
+
+  return prisma.user.findUnique({
+    where: { email: String(email) },
+    include: {
+      customer: {
+        include: {
+          machineAccess: true,
+        },
+      },
+    },
+  });
+}
+
+function customerAllowedMachineIds(user) {
+  return user?.customer?.machineAccess?.map((access) => access.machineId) || [];
+}
+
+function isCustomerForbiddenForMachine(user, machineId) {
+  if (!user || user.role !== "CUSTOMER") {
+    return false;
+  }
+
+  return !customerAllowedMachineIds(user).includes(Number(machineId));
+}
+
+function sendForbiddenMachineAccess(res) {
+  return res.status(403).json({
+    error: "FORBIDDEN",
+    message: "You do not have access to this machine",
+  });
+}
+
 async function findMachineByIdentifier(machineIdentifier, queryOptions = {}) {
   const numericMachineId = parseMachineId(machineIdentifier);
 
@@ -841,6 +879,86 @@ router.get("/auth/me", async (req, res) => {
     });
   } catch (error) {
     return sendInternalError("Current user error", error, res);
+  }
+});
+
+router.get("/me/access", async (req, res) => {
+  try {
+    const email = String(req.headers["x-user-email"] || "")
+      .trim()
+      .toLowerCase();
+
+    if (!email) {
+      return res.status(400).json({
+        error: "x-user-email header is required",
+      });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email },
+      include: {
+        company: true,
+        customer: {
+          include: {
+            machineAccess: {
+              select: { machineId: true },
+            },
+            moduleAccess: {
+              where: { enabled: true },
+              select: { moduleKey: true },
+            },
+            featureAccess: {
+              where: { enabled: true },
+              select: { featureKey: true },
+            },
+            parameterAccess: {
+              where: { enabled: true },
+              select: { parameterKey: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        error: "User not found",
+      });
+    }
+
+    const isCustomer = user.role === "CUSTOMER";
+    const customer = user.customer;
+
+    return res.json({
+      role: user.role,
+      company: user.company,
+      customer,
+      allowedMachines:
+        isCustomer && customer
+          ? customer.machineAccess.map((access) => access.machineId)
+          : "ALL",
+      allowedModules:
+        isCustomer && customer
+          ? customer.moduleAccess.map((access) => access.moduleKey)
+          : "ALL",
+      allowedFeatures:
+        isCustomer && customer
+          ? customer.featureAccess.map((access) => access.featureKey)
+          : "ALL",
+      allowedParameters:
+        isCustomer && customer
+          ? customer.parameterAccess.map((access) => access.parameterKey)
+          : "ALL",
+    });
+  } catch (error) {
+    console.error("Get current access error", getErrorDetails(error));
+
+    return res.status(500).json({
+      error:
+        process.env.NODE_ENV === "development"
+          ? error.message || "Internal server error"
+          : "Internal server error",
+    });
   }
 });
 
@@ -1808,6 +1926,11 @@ router.get("/machine/:id/production/daily", async (req, res) => {
       });
     }
 
+    const accessUser = await getAccessUser(req);
+    if (isCustomerForbiddenForMachine(accessUser, machine.id)) {
+      return sendForbiddenMachineAccess(res);
+    }
+
     if (!(await canAccessMachine(req.user, machine.id))) {
       return res.status(403).json({
         error: "Machine access denied",
@@ -1853,6 +1976,11 @@ router.get("/machine/:id/production/timeline", async (req, res) => {
       });
     }
 
+    const accessUser = await getAccessUser(req);
+    if (isCustomerForbiddenForMachine(accessUser, machine.id)) {
+      return sendForbiddenMachineAccess(res);
+    }
+
     if (!(await canAccessMachine(req.user, machine.id))) {
       return res.status(403).json({
         error: "Machine access denied",
@@ -1890,6 +2018,11 @@ router.get("/machine/:id/overview", async (req, res) => {
       return res.status(404).json({
         error: `Machine with identifier ${machineIdentifier} not found`,
       });
+    }
+
+    const accessUser = await getAccessUser(req);
+    if (isCustomerForbiddenForMachine(accessUser, machine.id)) {
+      return sendForbiddenMachineAccess(res);
     }
 
     if (!(await canAccessMachine(req.user, machine.id))) {
