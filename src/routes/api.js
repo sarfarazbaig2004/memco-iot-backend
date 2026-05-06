@@ -229,8 +229,8 @@ function sanitizeCustomerUser(user) {
   return safeUser;
 }
 
-async function getDefaultCompany() {
-  const memco = await prisma.company.findUnique({
+async function getDefaultCompany(client = prisma) {
+  const memco = await client.company.findUnique({
     where: { code: "MEMCO" },
   });
 
@@ -238,7 +238,7 @@ async function getDefaultCompany() {
     return memco;
   }
 
-  return prisma.company.findFirst({
+  return client.company.findFirst({
     orderBy: { id: "asc" },
   });
 }
@@ -275,6 +275,207 @@ function buildUserAccessSummary(user, machineCount) {
     parameters: [],
     allMachines: machineCount > 0 && assignedMachineCount === machineCount,
   };
+}
+
+function normalizeCustomerAccessRecord(record) {
+  return {
+    email: record.email,
+    allowedMachines: Array.isArray(record.allowedMachines)
+      ? record.allowedMachines
+      : [],
+    machineIds: record.machineIds || [],
+    allowedModules: record.allowedModules || [],
+    allowedFeatures: record.allowedFeatures || [],
+    allowedParameters: record.allowedParameters || [],
+    updatedAt: record.updatedAt,
+  };
+}
+
+function parseCustomerAccessInput(body) {
+  const email = parseRequiredText(body.email)?.toLowerCase();
+  const machineIds = parseMachineIds(body.machineIds ?? body.machines);
+  const allowedModules = uniqueTextValues(body.allowedModules ?? body.modules);
+  const allowedFeatures = uniqueTextValues(body.allowedFeatures ?? body.features);
+  const allowedParameters = uniqueTextValues(
+    body.allowedParameters ?? body.parameters
+  );
+  const allowedMachines = Array.isArray(body.allowedMachines)
+    ? body.allowedMachines
+    : machineIds;
+
+  return {
+    email,
+    allowedMachines,
+    machineIds,
+    allowedModules,
+    allowedFeatures,
+    allowedParameters,
+  };
+}
+
+async function getCustomerAccessRecord(email, client = prisma) {
+  if (!email || !client.customerAccess) {
+    return null;
+  }
+
+  return client.customerAccess.findUnique({
+    where: { email },
+  });
+}
+
+async function getCustomerAccessByEmail(email) {
+  const normalizedEmail = parseRequiredText(email)?.toLowerCase();
+
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  const savedAccess = await getCustomerAccessRecord(normalizedEmail);
+
+  if (savedAccess) {
+    return normalizeCustomerAccessRecord(savedAccess);
+  }
+
+  const customer = prisma.customer
+    ? await prisma.customer.findUnique({
+        where: { email: normalizedEmail },
+        include: {
+          machineAccess: true,
+          moduleAccess: true,
+          featureAccess: true,
+          parameterAccess: true,
+        },
+      })
+    : null;
+
+  if (!customer) {
+    return null;
+  }
+
+  const access = buildCustomerAccessPayload(customer);
+
+  return {
+    email: normalizedEmail,
+    allowedMachines: access.machines,
+    machineIds: access.machines,
+    allowedModules: access.modules,
+    allowedFeatures: access.features,
+    allowedParameters: access.parameters,
+    updatedAt: customer.updatedAt,
+  };
+}
+
+async function syncCustomerAccessRows(tx, user, access) {
+  if (!user || user.role !== "CUSTOMER") {
+    return null;
+  }
+
+  const company = await getDefaultCompany(tx);
+  const now = new Date();
+  const customer = await findCustomerForUser(user, tx);
+
+  const savedCustomer =
+    customer ||
+    (company && tx.customer
+      ? await tx.customer.create({
+          data: {
+            name: user.name,
+            email: user.email,
+            companyId: company.id,
+            userId: user.id,
+            active: true,
+            updatedAt: now,
+          },
+        })
+      : null);
+
+  await tx.userModuleAccess.deleteMany({ where: { userId: user.id } });
+  await tx.userMachineAccess.deleteMany({ where: { userId: user.id } });
+
+  if (access.allowedModules.length > 0) {
+    await tx.userModuleAccess.createMany({
+      data: access.allowedModules.map((moduleKey) => ({
+        userId: user.id,
+        moduleKey,
+        enabled: true,
+      })),
+    });
+  }
+
+  if (access.machineIds.length > 0) {
+    await tx.userMachineAccess.createMany({
+      data: access.machineIds.map((machineId) => ({
+        userId: user.id,
+        machineId,
+      })),
+    });
+  }
+
+  if (!savedCustomer) {
+    return null;
+  }
+
+  await tx.customer.update({
+    where: { id: savedCustomer.id },
+    data: { updatedAt: now },
+  });
+
+  await tx.customerModuleAccess.deleteMany({
+    where: { customerId: savedCustomer.id },
+  });
+  await tx.customerMachineAccess.deleteMany({
+    where: { customerId: savedCustomer.id },
+  });
+  await tx.customerFeatureAccess.deleteMany({
+    where: { customerId: savedCustomer.id },
+  });
+  await tx.customerParameterAccess.deleteMany({
+    where: { customerId: savedCustomer.id },
+  });
+
+  if (access.allowedModules.length > 0) {
+    await tx.customerModuleAccess.createMany({
+      data: access.allowedModules.map((moduleKey) => ({
+        customerId: savedCustomer.id,
+        moduleKey,
+        enabled: true,
+        updatedAt: now,
+      })),
+    });
+  }
+
+  if (access.machineIds.length > 0) {
+    await tx.customerMachineAccess.createMany({
+      data: access.machineIds.map((machineId) => ({
+        customerId: savedCustomer.id,
+        machineId,
+      })),
+    });
+  }
+
+  if (access.allowedFeatures.length > 0) {
+    await tx.customerFeatureAccess.createMany({
+      data: access.allowedFeatures.map((featureKey) => ({
+        customerId: savedCustomer.id,
+        featureKey,
+        enabled: true,
+        updatedAt: now,
+      })),
+    });
+  }
+
+  if (access.allowedParameters.length > 0) {
+    await tx.customerParameterAccess.createMany({
+      data: access.allowedParameters.map((parameterKey) => ({
+        customerId: savedCustomer.id,
+        parameterKey,
+        enabled: true,
+        updatedAt: now,
+      })),
+    });
+  }
+
+  return savedCustomer;
 }
 
 async function findCustomerForUser(user, client = prisma) {
@@ -904,10 +1105,15 @@ async function buildUserAccessPayload(user) {
       modules: MODULE_KEYS,
       machines: [],
       allMachines: true,
+      machineIds: [],
+      allowedMachines: "ALL",
+      allowedModules: "ALL",
+      allowedFeatures: "ALL",
+      allowedParameters: "ALL",
     };
   }
 
-  const [moduleRows, machineRows] = await Promise.all([
+  const [moduleRows, machineRows, savedAccess] = await Promise.all([
     prisma.userModuleAccess.findMany({
       where: {
         userId: user.id,
@@ -929,12 +1135,23 @@ async function buildUserAccessPayload(user) {
         },
       },
     }),
+    user.role === "CUSTOMER" ? getCustomerAccessByEmail(user.email) : null,
   ]);
 
+  const machineIds = machineRows.map((row) => row.machineId);
+  const modules = moduleRows.map((row) => row.moduleKey);
+
   return {
-    modules: moduleRows.map((row) => row.moduleKey),
+    modules,
     machines: machineRows.map((row) => row.machine),
+    features: savedAccess?.allowedFeatures || [],
+    parameters: savedAccess?.allowedParameters || [],
     allMachines: false,
+    machineIds,
+    allowedMachines: savedAccess?.allowedMachines || machineIds,
+    allowedModules: savedAccess?.allowedModules || modules,
+    allowedFeatures: savedAccess?.allowedFeatures || [],
+    allowedParameters: savedAccess?.allowedParameters || [],
   };
 }
 
@@ -1030,15 +1247,25 @@ router.get("/me/access", async (req, res) => {
 
     const isCustomer = user.role === "CUSTOMER";
     const access = buildUserAccessSummary(user, 0);
+    const savedAccess = isCustomer ? await getCustomerAccessByEmail(email) : null;
 
     return res.json({
       role: user.role,
       company: null,
       customer: null,
-      allowedMachines: isCustomer ? access.machines : "ALL",
-      allowedModules: isCustomer ? access.modules : "ALL",
-      allowedFeatures: isCustomer ? [] : "ALL",
-      allowedParameters: isCustomer ? [] : "ALL",
+      allowedMachines: isCustomer
+        ? savedAccess?.allowedMachines || access.machines
+        : "ALL",
+      machineIds: isCustomer ? savedAccess?.machineIds || access.machines : "ALL",
+      allowedModules: isCustomer
+        ? savedAccess?.allowedModules || access.modules
+        : "ALL",
+      allowedFeatures: isCustomer
+        ? savedAccess?.allowedFeatures || []
+        : "ALL",
+      allowedParameters: isCustomer
+        ? savedAccess?.allowedParameters || []
+        : "ALL",
     });
   } catch (error) {
     console.error("Get current access error", getErrorDetails(error));
@@ -1049,6 +1276,129 @@ router.get("/me/access", async (req, res) => {
           ? error.message || "Internal server error"
           : "Internal server error",
     });
+  }
+});
+
+router.get("/admin/customer-access", async (req, res) => {
+  const adminUser = await requireCompanySuperAdmin(req, res);
+
+  if (!adminUser) {
+    return;
+  }
+
+  try {
+    const email = parseRequiredText(req.query.email)?.toLowerCase();
+
+    if (email) {
+      const access = await getCustomerAccessByEmail(email);
+
+      if (!access) {
+        return res.status(404).json({
+          error: "Customer access not found",
+        });
+      }
+
+      console.log("Customer access loaded", {
+        email,
+        requestedBy: adminUser.email,
+      });
+
+      return res.json(access);
+    }
+
+    const records = await prisma.customerAccess.findMany({
+      orderBy: { email: "asc" },
+    });
+
+    console.log("Customer access list loaded", {
+      count: records.length,
+      requestedBy: adminUser.email,
+    });
+
+    return res.json(records.map(normalizeCustomerAccessRecord));
+  } catch (error) {
+    return sendInternalError("List customer access error", error, res);
+  }
+});
+
+router.post("/admin/customer-access", async (req, res) => {
+  const adminUser = await requireCompanySuperAdmin(req, res);
+
+  if (!adminUser) {
+    return;
+  }
+
+  try {
+    const access = parseCustomerAccessInput(req.body);
+
+    if (!access.email) {
+      return res.status(400).json({
+        error: "email is required",
+      });
+    }
+
+    if (access.machineIds.length > 0) {
+      const machineCount = await prisma.machine.count({
+        where: { id: { in: access.machineIds } },
+      });
+
+      if (machineCount !== access.machineIds.length) {
+        return res.status(400).json({
+          error: "One or more machine ids do not exist",
+        });
+      }
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: access.email },
+    });
+
+    if (!user || user.role !== "CUSTOMER") {
+      return res.status(404).json({
+        error: "Customer user not found",
+      });
+    }
+
+    const saved = await prisma.$transaction(
+      async (tx) => {
+        const record = await tx.customerAccess.upsert({
+          where: { email: access.email },
+          update: {
+            allowedMachines: access.allowedMachines,
+            machineIds: access.machineIds,
+            allowedModules: access.allowedModules,
+            allowedFeatures: access.allowedFeatures,
+            allowedParameters: access.allowedParameters,
+          },
+          create: {
+            email: access.email,
+            allowedMachines: access.allowedMachines,
+            machineIds: access.machineIds,
+            allowedModules: access.allowedModules,
+            allowedFeatures: access.allowedFeatures,
+            allowedParameters: access.allowedParameters,
+          },
+        });
+
+        await syncCustomerAccessRows(tx, user, access);
+
+        return record;
+      },
+      { timeout: 20000 }
+    );
+
+    console.log("Customer access saved", {
+      email: access.email,
+      machineCount: access.machineIds.length,
+      moduleCount: access.allowedModules.length,
+      featureCount: access.allowedFeatures.length,
+      parameterCount: access.allowedParameters.length,
+      requestedBy: adminUser.email,
+    });
+
+    return res.json(normalizeCustomerAccessRecord(saved));
+  } catch (error) {
+    return sendPrismaWriteError("Save customer access error", error, res);
   }
 });
 
@@ -1243,101 +1593,123 @@ router.put("/admin/customers/:id/access", async (req, res) => {
     }
 
     const now = new Date();
-    const updatedCustomer = await prisma.$transaction(async (tx) => {
-      await tx.userModuleAccess.deleteMany({ where: { userId } });
-      await tx.userMachineAccess.deleteMany({ where: { userId } });
+    const updatedCustomer = await prisma.$transaction(
+      async (tx) => {
+        await tx.userModuleAccess.deleteMany({ where: { userId } });
+        await tx.userMachineAccess.deleteMany({ where: { userId } });
 
-      if (customer && tx.customerModuleAccess) {
-        await tx.customerModuleAccess.deleteMany({
-          where: { customerId: customer.id },
-        });
-      }
-
-      if (customer && tx.customerMachineAccess) {
-        await tx.customerMachineAccess.deleteMany({
-          where: { customerId: customer.id },
-        });
-      }
-
-      if (customer && tx.customerFeatureAccess) {
-        await tx.customerFeatureAccess.deleteMany({
-          where: { customerId: customer.id },
-        });
-      }
-
-      if (customer && tx.customerParameterAccess) {
-        await tx.customerParameterAccess.deleteMany({
-          where: { customerId: customer.id },
-        });
-      }
-
-      if (modules.length > 0) {
-        await tx.userModuleAccess.createMany({
-          data: modules.map((moduleKey) => ({
-            userId,
-            moduleKey,
-            enabled: true,
-          })),
-        });
         if (customer && tx.customerModuleAccess) {
-          await tx.customerModuleAccess.createMany({
+          await tx.customerModuleAccess.deleteMany({
+            where: { customerId: customer.id },
+          });
+        }
+
+        if (customer && tx.customerMachineAccess) {
+          await tx.customerMachineAccess.deleteMany({
+            where: { customerId: customer.id },
+          });
+        }
+
+        if (customer && tx.customerFeatureAccess) {
+          await tx.customerFeatureAccess.deleteMany({
+            where: { customerId: customer.id },
+          });
+        }
+
+        if (customer && tx.customerParameterAccess) {
+          await tx.customerParameterAccess.deleteMany({
+            where: { customerId: customer.id },
+          });
+        }
+
+        if (modules.length > 0) {
+          await tx.userModuleAccess.createMany({
             data: modules.map((moduleKey) => ({
-              customerId: customer.id,
+              userId,
               moduleKey,
+              enabled: true,
+            })),
+          });
+          if (customer && tx.customerModuleAccess) {
+            await tx.customerModuleAccess.createMany({
+              data: modules.map((moduleKey) => ({
+                customerId: customer.id,
+                moduleKey,
+                enabled: true,
+                updatedAt: now,
+              })),
+            });
+          }
+        }
+
+        if (machineIds.length > 0) {
+          await tx.userMachineAccess.createMany({
+            data: machineIds.map((machineId) => ({
+              userId,
+              machineId,
+            })),
+          });
+          if (customer && tx.customerMachineAccess) {
+            await tx.customerMachineAccess.createMany({
+              data: machineIds.map((machineId) => ({
+                customerId: customer.id,
+                machineId,
+              })),
+            });
+          }
+        }
+
+        if (customer && tx.customerFeatureAccess && features.length > 0) {
+          await tx.customerFeatureAccess.createMany({
+            data: features.map((featureKey) => ({
+              customerId: customer.id,
+              featureKey,
               enabled: true,
               updatedAt: now,
             })),
           });
         }
-      }
 
-      if (machineIds.length > 0) {
-        await tx.userMachineAccess.createMany({
-          data: machineIds.map((machineId) => ({
-            userId,
-            machineId,
-          })),
-        });
-        if (customer && tx.customerMachineAccess) {
-          await tx.customerMachineAccess.createMany({
-            data: machineIds.map((machineId) => ({
+        if (customer && tx.customerParameterAccess && parameters.length > 0) {
+          await tx.customerParameterAccess.createMany({
+            data: parameters.map((parameterKey) => ({
               customerId: customer.id,
-              machineId,
+              parameterKey,
+              enabled: true,
+              updatedAt: now,
             })),
           });
         }
-      }
 
-      if (customer && tx.customerFeatureAccess && features.length > 0) {
-        await tx.customerFeatureAccess.createMany({
-          data: features.map((featureKey) => ({
-            customerId: customer.id,
-            featureKey,
-            enabled: true,
-            updatedAt: now,
-          })),
+        await tx.customerAccess.upsert({
+          where: { email: user.email },
+          update: {
+            allowedMachines: machineIds,
+            machineIds,
+            allowedModules: modules,
+            allowedFeatures: features,
+            allowedParameters: parameters,
+          },
+          create: {
+            email: user.email,
+            allowedMachines: machineIds,
+            machineIds,
+            allowedModules: modules,
+            allowedFeatures: features,
+            allowedParameters: parameters,
+          },
         });
-      }
 
-      if (customer && tx.customerParameterAccess && parameters.length > 0) {
-        await tx.customerParameterAccess.createMany({
-          data: parameters.map((parameterKey) => ({
-            customerId: customer.id,
-            parameterKey,
-            enabled: true,
-            updatedAt: now,
-          })),
+        return tx.user.findUnique({
+          where: { id: userId },
+          include: {
+            moduleAccesses: true,
+            machineAccesses: true,
+          },
         });
-      }
-
-      return tx.user.findUnique({
-        where: { id: userId },
-        include: {
-          moduleAccesses: true,
-          machineAccesses: true,
-        },
-      });
-    });
+      },
+      { timeout: 20000 }
+    );
 
     return res.json({
       id: updatedCustomer.id,

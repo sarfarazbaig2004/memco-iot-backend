@@ -192,6 +192,20 @@ model Customer {
   @@index([companyId])
 }
 
+model CustomerAccess {
+  id                Int      @id @default(autoincrement())
+  email             String   @unique
+  allowedMachines   Json     @default("[]")
+  machineIds        Int[]    @default([])
+  allowedModules    String[] @default([])
+  allowedFeatures   String[] @default([])
+  allowedParameters String[] @default([])
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([email])
+}
+
 model CustomerMachineAccess {
   id         Int      @id @default(autoincrement())
   customerId Int
