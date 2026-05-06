@@ -174,20 +174,20 @@ model User {
 }
 
 model Customer {
-  id                      Int                       @id @default(autoincrement())
-  companyId               Int
-  userId                  Int                       @unique
-  name                    String
-  email                   String                    @unique
-  active                  Boolean                   @default(true)
-  createdAt               DateTime                  @default(now())
-  updatedAt               DateTime
-  company                 Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  user                    User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  CustomerFeatureAccess   CustomerFeatureAccess[]
-  machineAccess           CustomerMachineAccess[]
-  CustomerModuleAccess    CustomerModuleAccess[]
-  CustomerParameterAccess CustomerParameterAccess[]
+  id              Int                       @id @default(autoincrement())
+  companyId       Int
+  userId          Int                       @unique
+  name            String
+  email           String                    @unique
+  active          Boolean                   @default(true)
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime
+  company         Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user            User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  featureAccess   CustomerFeatureAccess[]
+  machineAccess   CustomerMachineAccess[]
+  moduleAccess    CustomerModuleAccess[]
+  parameterAccess CustomerParameterAccess[]
 
   @@index([companyId])
 }
@@ -236,7 +236,7 @@ model CustomerFeatureAccess {
   enabled    Boolean  @default(true)
   createdAt  DateTime @default(now())
   updatedAt  DateTime
-  Customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
 
   @@unique([customerId, featureKey])
   @@index([featureKey])
@@ -249,7 +249,7 @@ model CustomerModuleAccess {
   enabled    Boolean  @default(true)
   createdAt  DateTime @default(now())
   updatedAt  DateTime
-  Customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
 
   @@unique([customerId, moduleKey])
   @@index([moduleKey])
@@ -262,7 +262,7 @@ model CustomerParameterAccess {
   enabled      Boolean  @default(true)
   createdAt    DateTime @default(now())
   updatedAt    DateTime
-  Customer     Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer     Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
 
   @@unique([customerId, parameterKey])
   @@index([parameterKey])

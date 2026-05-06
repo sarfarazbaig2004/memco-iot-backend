@@ -111,6 +111,8 @@ function verifyPassword(password, passwordHash) {
 
 function getPermissionsForRole(role) {
   switch (role) {
+    case "SOFTWARE_SUPER_ADMIN":
+    case "COMPANY_SUPER_ADMIN":
     case "SUPER_ADMIN":
       return [
         "view_fleet",
