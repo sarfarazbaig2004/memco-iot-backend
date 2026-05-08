@@ -1,0 +1,14 @@
+ALTER TABLE "WelderArcEvent"
+ADD COLUMN "avgCurrent" DOUBLE PRECISION,
+ADD COLUMN "avgVoltage" DOUBLE PRECISION,
+ADD COLUMN "peakCurrent" DOUBLE PRECISION,
+ADD COLUMN "peakVoltage" DOUBLE PRECISION,
+ADD COLUMN "minCurrent" DOUBLE PRECISION,
+ADD COLUMN "minVoltage" DOUBLE PRECISION,
+ADD COLUMN "energyKwh" DOUBLE PRECISION,
+ADD COLUMN "depositionKg" DOUBLE PRECISION,
+ADD COLUMN "qualityStatus" TEXT,
+ADD COLUMN "electrodeRunNo" INTEGER NOT NULL DEFAULT 1;
+
+CREATE INDEX "WelderArcEvent_machineId_electrodeRunNo_idx"
+ON "WelderArcEvent"("machineId", "electrodeRunNo");

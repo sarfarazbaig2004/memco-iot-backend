@@ -24,6 +24,7 @@ model Machine {
   machineCode              String
   model                    String
   machineType              MachineType              @default(SINGLE_PHASE)
+  welderTrackingMode       WelderTrackingMode       @default(MANUAL)
   location                 String?
   status                   String                   @default("ACTIVE")
   createdAt                DateTime                 @default(now())
@@ -34,12 +35,14 @@ model Machine {
   showPhaseVoltageB        Boolean                  @default(false)
   showInputVoltageSingle   Boolean                  @default(true)
   CustomerMachineAccess    CustomerMachineAccess[]
+  activeWelderAssignments  ActiveWelderAssignment[]
   dailyProductionSummaries DailyProductionSummary[]
   company                  Company                  @relation(fields: [companyId], references: [id])
   latestTelemetry          MachineLatestTelemetry?
   productionEvents         MachineProductionEvent[]
   telemetry                Telemetry[]
   userAccesses             UserMachineAccess[]
+  welderArcEvents          WelderArcEvent[]
   welderSessions           WelderSession[]
 }
 
@@ -127,12 +130,14 @@ model DailyProductionSummary {
 }
 
 model Welder {
-  id           Int             @id @default(autoincrement())
-  name         String
-  employeeCode String          @unique
-  rfidCardNo   String          @unique
-  active       Boolean         @default(true)
-  sessions     WelderSession[]
+  id                      Int                      @id @default(autoincrement())
+  name                    String
+  employeeCode            String                   @unique
+  rfidCardNo              String                   @unique
+  active                  Boolean                  @default(true)
+  activeWelderAssignments ActiveWelderAssignment[]
+  arcEvents               WelderArcEvent[]
+  sessions                WelderSession[]
 }
 
 model WelderSession {
@@ -156,6 +161,74 @@ model WelderSession {
   @@index([machineId, status])
   @@index([welderId, status])
   @@index([rfidCardNo])
+}
+
+model ActiveWelderAssignment {
+  id              Int                @id @default(autoincrement())
+  machineId       Int
+  welderId        Int?
+  trackingMode    WelderTrackingMode @default(MANUAL)
+  status          String             @default("ACTIVE")
+  welderName      String?
+  employeeCode    String?
+  rfidCardNo      String?
+  startedAt       DateTime           @default(now())
+  endedAt         DateTime?
+  createdByUserId Int?
+  endedByUserId   Int?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  arcEvents       WelderArcEvent[]
+  machine         Machine            @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  welder          Welder?            @relation(fields: [welderId], references: [id], onDelete: SetNull)
+
+  @@index([machineId, status])
+  @@index([machineId, startedAt])
+  @@index([welderId, status])
+  @@index([trackingMode])
+}
+
+model WelderArcEvent {
+  id                 Int                     @id @default(autoincrement())
+  machineId          Int
+  assignmentId       Int?
+  welderId           Int?
+  trackingMode       WelderTrackingMode?
+  welderName         String?
+  employeeCode       String?
+  rfidCardNo         String?
+  startTime          DateTime
+  endTime            DateTime?
+  durationSeconds    Int?
+  startTelemetryId   Int?
+  endTelemetryId     Int?
+  startOutputVoltage Float?
+  startOutputCurrent Float?
+  endOutputVoltage   Float?
+  endOutputCurrent   Float?
+  avgCurrent         Float?
+  avgVoltage         Float?
+  peakCurrent        Float?
+  peakVoltage        Float?
+  minCurrent         Float?
+  minVoltage         Float?
+  energyKwh          Float?
+  depositionKg       Float?
+  rawSamples         Json?
+  qualityStatus      String?
+  electrodeRunNo     Int                     @default(1)
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  assignment         ActiveWelderAssignment? @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  machine            Machine                 @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  welder             Welder?                 @relation(fields: [welderId], references: [id], onDelete: SetNull)
+
+  @@index([machineId, startTime])
+  @@index([machineId, endTime])
+  @@index([machineId, electrodeRunNo])
+  @@index([assignmentId])
+  @@index([welderId, startTime])
+  @@index([qualityStatus])
 }
 
 model User {
@@ -297,4 +370,11 @@ enum InputVoltageMode {
   SINGLE
   THREE_PHASE
   HIDDEN
+}
+
+enum WelderTrackingMode {
+  MANUAL
+  RFID
+  MIXED
+  DISABLED
 }

@@ -9,6 +9,7 @@ const {
 } = require("../auth");
 const {
   updateActiveWelderSessionFromTelemetry,
+  buildArcEngineDiagnostics,
 } = require("../welderSessions");
 const {
   getDailyProductionSummary,
@@ -29,6 +30,7 @@ const MODULE_KEYS = [
   "calibration",
   "reports",
 ];
+const WELDER_TRACKING_MODES = ["MANUAL", "RFID", "MIXED", "DISABLED"];
 const machineControlState = new Map();
 
 function parseMachineId(rawId) {
@@ -599,6 +601,22 @@ function parseOptionalString(value) {
   return parsedValue || null;
 }
 
+function parseOptionalDate(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  const parsedValue = new Date(value);
+
+  return Number.isNaN(parsedValue.getTime()) ? null : parsedValue;
+}
+
+function parseWelderTrackingMode(value, fallback = "MANUAL") {
+  const mode = parseRequiredText(value)?.toUpperCase();
+
+  return WELDER_TRACKING_MODES.includes(mode) ? mode : fallback;
+}
+
 function buildMapUrl(gpsLat, gpsLng, mapUrl) {
   if (mapUrl) {
     return mapUrl;
@@ -1054,6 +1072,86 @@ function formatWelderSessionForUser(session, user) {
 
 function formatWelderSessionsForUser(sessions, user) {
   return sessions.map((session) => formatWelderSessionForUser(session, user));
+}
+
+function formatWelderAssignment(assignment) {
+  if (!assignment) {
+    return null;
+  }
+
+  return {
+    id: assignment.id,
+    machineId: assignment.machineId,
+    welderId: assignment.welderId,
+    trackingMode: assignment.trackingMode,
+    status: assignment.status,
+    welderName: assignment.welderName || assignment.welder?.name || "UNKNOWN",
+    employeeCode: assignment.employeeCode || assignment.welder?.employeeCode || null,
+    rfidCardNo: assignment.rfidCardNo || assignment.welder?.rfidCardNo || null,
+    startedAt: assignment.startedAt,
+    endedAt: assignment.endedAt,
+    createdAt: assignment.createdAt,
+    updatedAt: assignment.updatedAt,
+    machine: assignment.machine
+      ? {
+          id: assignment.machine.id,
+          machineCode: assignment.machine.machineCode,
+          serialNumber: assignment.machine.serialNumber || "",
+          location: assignment.machine.location || "Shop Floor",
+        }
+      : null,
+    welder: assignment.welder
+      ? {
+          id: assignment.welder.id,
+          name: assignment.welder.name,
+          employeeCode: assignment.welder.employeeCode,
+          rfidCardNo: assignment.welder.rfidCardNo,
+          active: assignment.welder.active,
+        }
+      : null,
+  };
+}
+
+function formatWelderArcEvent(event) {
+  if (!event) {
+    return null;
+  }
+
+  return {
+    id: event.id,
+    machineId: event.machineId,
+    assignmentId: event.assignmentId,
+    welderId: event.welderId,
+    trackingMode: event.trackingMode,
+    welderName: event.welderName || event.welder?.name || "UNKNOWN",
+    employeeCode: event.employeeCode || event.welder?.employeeCode || null,
+    rfidCardNo: event.rfidCardNo || event.welder?.rfidCardNo || null,
+    startTime: event.startTime,
+    endTime: event.endTime,
+    durationSeconds: event.durationSeconds,
+    startTelemetryId: event.startTelemetryId,
+    endTelemetryId: event.endTelemetryId,
+    startOutputVoltage: event.startOutputVoltage,
+    startOutputCurrent: event.startOutputCurrent,
+    endOutputVoltage: event.endOutputVoltage,
+    endOutputCurrent: event.endOutputCurrent,
+    machine: event.machine
+      ? {
+          id: event.machine.id,
+          machineCode: event.machine.machineCode,
+          serialNumber: event.machine.serialNumber || "",
+          location: event.machine.location || "Shop Floor",
+        }
+      : null,
+    welder: event.welder
+      ? {
+          id: event.welder.id,
+          name: event.welder.name,
+          employeeCode: event.welder.employeeCode,
+          rfidCardNo: event.welder.rfidCardNo,
+        }
+      : null,
+  };
 }
 
 async function findActiveWelderSession(machineId) {
@@ -2000,6 +2098,322 @@ router.post("/welders", async (req, res) => {
   }
 });
 
+router.post("/welder-assignments/manual", async (req, res) => {
+  const adminUser = await requireCompanySuperAdmin(req, res);
+
+  if (!adminUser) {
+    return;
+  }
+
+  try {
+    const machineIdentifier = parseMachineIdentifier(
+      req.body.machineId ?? req.body.machineCode ?? req.body.machine
+    );
+    const startedAt = parseOptionalDate(req.body.startedAt) || new Date();
+    const welderId = parseMachineId(req.body.welderId);
+    const employeeCode = parseRequiredText(req.body.employeeCode);
+    const rfidCardNo = parseRequiredText(
+      req.body.rfidCardNo ?? req.body.rfid ?? req.body.cardNo
+    );
+    const requestedWelderName = parseRequiredText(
+      req.body.welderName ?? req.body.name
+    );
+    const trackingMode = parseWelderTrackingMode(req.body.trackingMode, "MANUAL");
+
+    if (!machineIdentifier) {
+      return res.status(400).json({
+        error: "machineId or machineCode is required",
+      });
+    }
+
+    if (trackingMode === "DISABLED") {
+      return res.status(400).json({
+        error: "Manual assignments cannot be started with DISABLED tracking mode",
+      });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: {
+        id: true,
+        machineCode: true,
+        serialNumber: true,
+        location: true,
+      },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
+      });
+    }
+
+    let welder = null;
+
+    if (welderId) {
+      welder = await prisma.welder.findUnique({
+        where: { id: welderId },
+      });
+
+      if (!welder) {
+        return res.status(404).json({
+          error: `Welder with id ${welderId} not found`,
+        });
+      }
+    } else if (rfidCardNo) {
+      welder = await prisma.welder.findUnique({
+        where: { rfidCardNo },
+      });
+    } else if (employeeCode) {
+      welder = await prisma.welder.findUnique({
+        where: { employeeCode },
+      });
+    }
+
+    const assignment = await prisma.$transaction(async (tx) => {
+      await tx.activeWelderAssignment.updateMany({
+        where: {
+          machineId: machine.id,
+          status: "ACTIVE",
+          endedAt: null,
+        },
+        data: {
+          status: "ENDED",
+          endedAt: startedAt,
+          endedByUserId: Number(adminUser.id),
+        },
+      });
+
+      if (welder) {
+        await tx.activeWelderAssignment.updateMany({
+          where: {
+            welderId: welder.id,
+            status: "ACTIVE",
+            endedAt: null,
+          },
+          data: {
+            status: "ENDED",
+            endedAt: startedAt,
+            endedByUserId: Number(adminUser.id),
+          },
+        });
+      }
+
+      return tx.activeWelderAssignment.create({
+        data: {
+          machineId: machine.id,
+          welderId: welder?.id || null,
+          trackingMode,
+          status: "ACTIVE",
+          welderName: welder?.name || requestedWelderName || "UNKNOWN",
+          employeeCode: welder?.employeeCode || employeeCode || null,
+          rfidCardNo: welder?.rfidCardNo || rfidCardNo || null,
+          startedAt,
+          createdByUserId: Number(adminUser.id),
+        },
+        include: {
+          machine: true,
+          welder: true,
+        },
+      });
+    });
+
+    return res.status(201).json({
+      message: "Manual welder assignment started",
+      assignment: formatWelderAssignment(assignment),
+    });
+  } catch (error) {
+    return sendPrismaWriteError("Start manual welder assignment error", error, res);
+  }
+});
+
+router.post("/welder-assignments/:id/end", async (req, res) => {
+  const adminUser = await requireCompanySuperAdmin(req, res);
+
+  if (!adminUser) {
+    return;
+  }
+
+  try {
+    const assignmentId = parseMachineId(req.params.id);
+    const endedAt = parseOptionalDate(req.body.endedAt) || new Date();
+
+    if (!assignmentId) {
+      return res.status(400).json({
+        error: "Valid assignment id is required",
+      });
+    }
+
+    const existing = await prisma.activeWelderAssignment.findUnique({
+      where: { id: assignmentId },
+      include: { machine: true, welder: true },
+    });
+
+    if (!existing) {
+      return res.status(404).json({
+        error: `Active welder assignment with id ${assignmentId} not found`,
+      });
+    }
+
+    const assignment = await prisma.$transaction(async (tx) => {
+      const updated = await tx.activeWelderAssignment.update({
+        where: { id: assignmentId },
+        data: {
+          status: "ENDED",
+          endedAt,
+          endedByUserId: Number(adminUser.id),
+        },
+        include: {
+          machine: true,
+          welder: true,
+        },
+      });
+
+      const openArcEvent = await tx.welderArcEvent.findFirst({
+        where: {
+          assignmentId,
+          endTime: null,
+        },
+        orderBy: [{ startTime: "desc" }, { id: "desc" }],
+      });
+
+      if (openArcEvent && endedAt > openArcEvent.startTime) {
+        await tx.welderArcEvent.update({
+          where: { id: openArcEvent.id },
+          data: {
+            endTime: endedAt,
+            durationSeconds: Math.floor(
+              (endedAt.getTime() - openArcEvent.startTime.getTime()) / 1000
+            ),
+          },
+        });
+      }
+
+      return updated;
+    });
+
+    return res.json({
+      message: "Welder assignment ended",
+      assignment: formatWelderAssignment(assignment),
+    });
+  } catch (error) {
+    return sendPrismaWriteError("End welder assignment error", error, res);
+  }
+});
+
+router.get("/welder-assignments/active", async (req, res) => {
+  if (!requireAuthenticated(req, res)) {
+    return;
+  }
+
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.query.machineId);
+    const allowedMachineIds = await getAccessibleMachineIds(req.user);
+    let machineId = null;
+
+    if (machineIdentifier) {
+      const machine = await findMachineByIdentifier(machineIdentifier, {
+        select: { id: true },
+      });
+
+      if (!machine) {
+        return res.status(404).json({
+          error: `Machine with identifier ${machineIdentifier} not found`,
+        });
+      }
+
+      if (!(await canAccessMachine(req.user, machine.id))) {
+        return res.status(403).json({
+          error: "Machine access denied",
+        });
+      }
+
+      machineId = machine.id;
+    }
+
+    const assignments = await prisma.activeWelderAssignment.findMany({
+      where: {
+        status: "ACTIVE",
+        endedAt: null,
+        ...(machineId ? { machineId } : {}),
+        ...(allowedMachineIds === null || machineId
+          ? {}
+          : { machineId: { in: allowedMachineIds } }),
+      },
+      orderBy: [{ startedAt: "desc" }, { id: "desc" }],
+      include: {
+        machine: true,
+        welder: true,
+      },
+    });
+
+    return res.json(assignments.map(formatWelderAssignment));
+  } catch (error) {
+    return sendInternalError("List active welder assignments error", error, res);
+  }
+});
+
+router.get("/welder-arc-events", async (req, res) => {
+  if (!requireAuthenticated(req, res)) {
+    return;
+  }
+
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.query.machineId);
+    const from = parseOptionalDate(req.query.from);
+    const to = parseOptionalDate(req.query.to);
+    const limit = Math.min(parseMachineId(req.query.limit) || 100, 500);
+    const allowedMachineIds = await getAccessibleMachineIds(req.user);
+    let machineId = null;
+
+    if (machineIdentifier) {
+      const machine = await findMachineByIdentifier(machineIdentifier, {
+        select: { id: true },
+      });
+
+      if (!machine) {
+        return res.status(404).json({
+          error: `Machine with identifier ${machineIdentifier} not found`,
+        });
+      }
+
+      if (!(await canAccessMachine(req.user, machine.id))) {
+        return res.status(403).json({
+          error: "Machine access denied",
+        });
+      }
+
+      machineId = machine.id;
+    }
+
+    const events = await prisma.welderArcEvent.findMany({
+      where: {
+        ...(machineId ? { machineId } : {}),
+        ...(allowedMachineIds === null || machineId
+          ? {}
+          : { machineId: { in: allowedMachineIds } }),
+        ...(from || to
+          ? {
+              startTime: {
+                ...(from ? { gte: from } : {}),
+                ...(to ? { lte: to } : {}),
+              },
+            }
+          : {}),
+      },
+      orderBy: [{ startTime: "desc" }, { id: "desc" }],
+      take: limit,
+      include: {
+        machine: true,
+        welder: true,
+      },
+    });
+
+    return res.json(events.map(formatWelderArcEvent));
+  } catch (error) {
+    return sendInternalError("List welder arc events error", error, res);
+  }
+});
+
 router.post("/telemetry", async (req, res) => {
   const requestStartedAt = Date.now();
 
@@ -2563,6 +2977,51 @@ router.get("/telemetry", async (req, res) => {
     return res.json(telemetry);
   } catch (error) {
     return sendInternalError("Get telemetry error", error, res);
+  }
+});
+
+router.get("/debug/arc-engine/:machineId", async (req, res) => {
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.params.machineId);
+
+    if (!machineIdentifier) {
+      return res.status(400).json({
+        error: "Machine identifier is required",
+      });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: { id: true, machineCode: true },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
+      });
+    }
+
+    if (!(await canAccessMachine(req.user, machine.id))) {
+      return sendForbiddenMachineAccess(res);
+    }
+
+    const diagnostics = buildArcEngineDiagnostics(machine.id);
+    const latestTelemetry = await prisma.telemetry.findFirst({
+      where: { machineId: machine.id },
+      orderBy: [{ timestamp: "desc" }, { id: "desc" }],
+    });
+
+    return res.json({
+      machineId: machine.id,
+      machineCode: machine.machineCode,
+      thresholds: diagnostics.thresholds,
+      activeArcState: diagnostics.activeArcState,
+      debounceState: diagnostics.debounceState,
+      sampleCounts: diagnostics.sampleCounts,
+      counters: diagnostics.counters,
+      lastTelemetry: latestTelemetry,
+    });
+  } catch (error) {
+    return sendInternalError("Get arc engine diagnostics error", error, res);
   }
 });
 

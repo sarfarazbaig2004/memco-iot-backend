@@ -1,0 +1,4 @@
+-- No-op reconciliation migration.
+-- The Render production database already contains the customer access control
+-- schema objects for this migration name. This placeholder restores local
+-- migration history without dropping, recreating, or altering existing objects.

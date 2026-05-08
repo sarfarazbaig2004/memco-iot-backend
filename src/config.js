@@ -37,6 +37,30 @@ function parseIntegerEnv(name, defaultValue, options = {}) {
   return value;
 }
 
+function parseNumberEnv(name, defaultValue, options = {}) {
+  const rawValue = process.env[name];
+
+  if (rawValue === undefined || rawValue === "") {
+    return defaultValue;
+  }
+
+  const value = Number(rawValue);
+
+  if (!Number.isFinite(value)) {
+    throw new Error(`${name} must be a number`);
+  }
+
+  if (options.min !== undefined && value < options.min) {
+    throw new Error(`${name} must be greater than or equal to ${options.min}`);
+  }
+
+  if (options.max !== undefined && value > options.max) {
+    throw new Error(`${name} must be less than or equal to ${options.max}`);
+  }
+
+  return value;
+}
+
 function parseBooleanEnv(name, defaultValue = false) {
   const rawValue = process.env[name];
 
@@ -100,6 +124,26 @@ module.exports = Object.freeze({
   enableDemoTelemetry: parseBooleanEnv("ENABLE_DEMO_TELEMETRY", false),
   demoTelemetryIntervalMs: parseIntegerEnv("DEMO_TELEMETRY_INTERVAL_MS", 120000, {
     min: 1000,
+  }),
+  arcStartCurrentThreshold: parseNumberEnv("ARC_START_CURRENT_THRESHOLD", 20, {
+    min: 0,
+  }),
+  arcEndCurrentThreshold: parseNumberEnv("ARC_END_CURRENT_THRESHOLD", 20, {
+    min: 0,
+  }),
+  arcStartVoltageThreshold: parseNumberEnv("ARC_START_VOLTAGE_THRESHOLD", 10, {
+    min: 0,
+  }),
+  arcEndVoltageThreshold: parseNumberEnv("ARC_END_VOLTAGE_THRESHOLD", 10, {
+    min: 0,
+  }),
+  arcMinDurationMs: parseIntegerEnv("ARC_MIN_DURATION_MS", 100, {
+    min: 0,
+  }),
+  rawWaveformRetention: parseBooleanEnv("RAW_WAVEFORM_RETENTION", false),
+  arcEndDebounceMs: parseIntegerEnv("ARC_END_DEBOUNCE_MS", 2000, { min: 0 }),
+  newElectrodeGapSeconds: parseIntegerEnv("NEW_ELECTRODE_GAP_SECONDS", 45, {
+    min: 0,
   }),
   gracefulShutdownTimeoutMs: parseIntegerEnv(
     "GRACEFUL_SHUTDOWN_TIMEOUT_MS",

@@ -2,7 +2,9 @@ const mqtt = require("mqtt");
 const prisma = require("./db");
 const config = require("./config");
 const {
+  processMqttTelemetryForWelderArcEvents,
   updateActiveWelderSessionFromTelemetry,
+  recoverOpenArcStates,
 } = require("./welderSessions");
 const {
   processTelemetryForProduction,
@@ -506,6 +508,7 @@ async function persistTelemetry(telemetry) {
   });
 
   await updateActiveWelderSessionFromTelemetry(savedTelemetry);
+  await processMqttTelemetryForWelderArcEvents(savedTelemetry);
   const productionResult = await processTelemetryForProduction(savedTelemetry);
 
   console.log("[mqtt] active welder session update completed", {
@@ -720,12 +723,19 @@ function startMqttSubscription() {
   });
 }
 
-function startTelemetryService() {
+async function startTelemetryService() {
   if (isStarted) {
     return;
   }
 
   isStarted = true;
+
+  try {
+    await recoverOpenArcStates();
+  } catch (error) {
+    console.error("[mqtt] failed to recover open arc state:", error);
+  }
+
   // MQTT startup is isolated so broker issues never prevent the API from serving traffic.
   try {
     startMqttSubscription();

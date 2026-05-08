@@ -83,7 +83,7 @@ async function startServer() {
   await prisma.connectDB();
 
   // MQTT is optional infrastructure; the API should stay up even if the broker is down.
-  startTelemetryService();
+  await startTelemetryService();
 
   await new Promise((resolve) => {
     server = app.listen(config.port, config.host, resolve);
