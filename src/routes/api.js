@@ -2352,6 +2352,12 @@ router.get("/welder-assignments/active", async (req, res) => {
   }
 });
 
+router.get("/welder-arc-events.csv", async (req, res) => {
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", 'attachment; filename="welder-arc-events.csv"');
+  return res.send("Machine,Welder,Arc Start,Arc End,Duration Seconds,Average Current,Average Voltage,Quality\n");
+});
+
 router.get("/welder-arc-events", async (req, res) => {
   if (!requireAuthenticated(req, res)) {
     return;
@@ -3053,6 +3059,75 @@ router.get("/reports/live-welder-sessions", async (_req, res) => {
     return res.json(formatWelderSessionsForUser(sessions, _req.user));
   } catch (error) {
     return sendInternalError("Live welder session report error", error, res);
+  }
+});
+
+
+router.get("/reports/welder-arc-events.csv", async (req, res) => {
+  try {
+    const rows = [
+      [
+        "Machine",
+        "Serial Number",
+        "Welder",
+        "Arcing Time",
+        "Idle Time",
+        "Current",
+        "Voltage",
+        "Status",
+      ].join(","),
+    ];
+
+    const allowedMachineIds = await getAccessibleMachineIds(req.user);
+
+    const sessions = await prisma.welderSession.findMany({
+      where: {
+        status: "ACTIVE",
+        endedAt: null,
+        ...(allowedMachineIds === null
+          ? {}
+          : { machineId: { in: allowedMachineIds } }),
+      },
+      orderBy: { startedAt: "desc" },
+      include: {
+        welder: true,
+        machine: {
+          include: {
+            telemetry: {
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+              take: 1,
+            },
+          },
+        },
+      },
+    });
+
+    for (const session of sessions) {
+      const formatted = formatWelderSession(session);
+
+      rows.push(
+        [
+          formatted?.machine?.machineCode || "",
+          formatted?.machine?.serialNumber || "",
+          formatted?.welder?.name || "Unknown",
+          formatted?.arcingTime || "0:00:00",
+          formatted?.idleTime || "0:00:00",
+          formatted?.current || 0,
+          formatted?.voltage || 0,
+          formatted?.status || "",
+        ].join(",")
+      );
+    }
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="welder-arc-events.csv"'
+    );
+
+    return res.send(rows.join("\n"));
+  } catch (error) {
+    return sendInternalError("Welder arc CSV report error", error, res);
   }
 });
 
