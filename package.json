@@ -22,6 +22,7 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "mqtt": "^5.15.1",
+    "pdfkit": "^0.18.0",
     "pg": "^8.20.0"
   },
   "devDependencies": {

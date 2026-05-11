@@ -1,4 +1,5 @@
 const express = require("express");
+const PDFDocument = require("pdfkit");
 
 const prisma = require("../db");
 const {
@@ -3128,6 +3129,68 @@ router.get("/reports/welder-arc-events.csv", async (req, res) => {
     return res.send(rows.join("\n"));
   } catch (error) {
     return sendInternalError("Welder arc CSV report error", error, res);
+  }
+});
+
+router.get("/reports/welder-arc-events.pdf", async (req, res) => {
+  try {
+    const sessions = await prisma.welderSession.findMany({
+      where: {
+        status: "ACTIVE",
+        endedAt: null,
+      },
+      orderBy: { startedAt: "desc" },
+      include: {
+        welder: true,
+        machine: {
+          include: {
+            telemetry: {
+              orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+              take: 1,
+            },
+          },
+        },
+      },
+    });
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="welder-arc-report.pdf"'
+    );
+
+    const doc = new PDFDocument({ margin: 40, size: "A4" });
+    doc.pipe(res);
+
+    doc.fontSize(18).text("MEMCO Welder Arc Report", { align: "center" });
+    doc.moveDown();
+    doc.fontSize(10).text(`Date: ${req.query.date || new Date().toISOString().slice(0, 10)}`);
+    doc.moveDown();
+
+    doc.fontSize(10).text(
+      "Machine | Serial Number | Welder | Arcing Time | Idle Time | Current | Voltage | Status"
+    );
+    doc.moveDown(0.5);
+    doc.text("--------------------------------------------------------------------------");
+
+    sessions.forEach((session) => {
+      const formatted = formatWelderSession(session);
+
+      doc.text(
+        `${formatted?.machine?.machineCode || "-"} | ` +
+          `${formatted?.machine?.serialNumber || "-"} | ` +
+          `${formatted?.welder?.name || "Unknown"} | ` +
+          `${formatted?.arcingTime || "0:00:00"} | ` +
+          `${formatted?.idleTime || "0:00:00"} | ` +
+          `${formatted?.current || 0} A | ` +
+          `${formatted?.voltage || 0} V | ` +
+          `${formatted?.status || "-"}`
+      );
+    });
+
+    doc.end();
+  } catch (error) {
+    return sendInternalError("Welder arc PDF report error", error, res);
   }
 });
 
