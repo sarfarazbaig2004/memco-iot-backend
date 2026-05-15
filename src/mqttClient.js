@@ -103,6 +103,23 @@ function parseDateTimePayload(payload) {
   return payload.timestamp;
 }
 
+function formatHms(hours, minutes, seconds) {
+  return `${parseNumber(hours) || 0}:${parseNumber(minutes) || 0}:${parseNumber(seconds) || 0}`;
+}
+
+function parseProductionStats(data) {
+  if (!Array.isArray(data)) return null;
+
+  return {
+    arcTime: formatHms(data[0], data[1], data[2]),
+    idleTime: formatHms(data[3], data[4], data[5]),
+    dcEnergy: parseNumber(data[6]) || 0,
+    deposition: parseNumber(data[7]) || 0,
+    wireFeedMeter: parseNumber(data[8]) || 0,
+    arcCount: parseNumber(data[9]) || 0,
+  };
+}
+
 function parseMachineIdentifier(payload, topic) {
   if (topic === "machine/data/M_data") {
     console.log("[mqtt] TEMP mapping M_data → WM-001");
@@ -160,6 +177,8 @@ function hasWeldingPayload(payload) {
     "arcOn",
     "machineOn",
     "readings",
+    "mPdata",
+    "jPdata",
   ]);
 }
 
@@ -179,6 +198,8 @@ function summarizeTelemetry(telemetry) {
     heatSyncTemperature: telemetry.heatSyncTemperature,
     machineOn: telemetry.machineOn,
     arcOn: telemetry.arcOn,
+    runningJob: telemetry.runningJob,
+    machineLifetime: telemetry.machineLifetime,
     gpsFix: telemetry.gpsFix,
     gpsLat: telemetry.gpsLat,
     gpsLng: telemetry.gpsLng,
@@ -303,6 +324,12 @@ function normalizeTelemetryPayload(payload, topic) {
       normalizedPayload.arcOn ?? (normalizedPayload.outputCurrent || 0) > 15;
   }
 
+  normalizedPayload.runningJob =
+    normalizedPayload.runningJob ?? parseProductionStats(normalizedPayload.jPdata);
+
+  normalizedPayload.machineLifetime =
+    normalizedPayload.machineLifetime ?? parseProductionStats(normalizedPayload.mPdata);
+
   normalizedPayload.gpsLat =
     normalizedPayload.gpsLat ?? parseNumber(normalizedPayload.lat);
 
@@ -416,6 +443,8 @@ function normalizeTelemetryPayload(payload, topic) {
     heatSyncTemperature,
     machineOn,
     arcOn,
+    runningJob: normalizedPayload.runningJob,
+    machineLifetime: normalizedPayload.machineLifetime,
     gpsFix,
     gpsLat,
     gpsLng,
@@ -469,6 +498,8 @@ async function persistTelemetry(telemetry) {
     inputVoltage: savedTelemetry.inputVoltage,
     arcOn: savedTelemetry.arcOn,
     machineOn: savedTelemetry.machineOn,
+    runningJob: telemetry.runningJob,
+    machineLifetime: telemetry.machineLifetime,
     elapsedMs: Date.now() - startedAt,
   });
 
