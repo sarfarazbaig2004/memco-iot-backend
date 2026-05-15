@@ -3478,6 +3478,25 @@ router.get("/machine/:id/overview", async (req, res) => {
       alarms,
       warnings,
       trend,
+
+      runningJob: telemetry.runningJob || {
+        arcTime: "0:0:0",
+        idleTime: "0:0:0",
+        dcEnergy: 0,
+        deposition: 0,
+        wireFeedMeter: 0,
+        arcCount: 0,
+      },
+
+      lifetime: telemetry.machineLifetime || {
+        arcTime: "0:0:0",
+        idleTime: "0:0:0",
+        dcEnergy: 0,
+        deposition: 0,
+        wireFeedMeter: 0,
+        arcCount: 0,
+      },
+
       activeWelderSession: formatWelderSession(activeSession),
       activeWelder: activeSession?.welder
         ? {
