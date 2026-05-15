@@ -33,6 +33,7 @@ const MODULE_KEYS = [
 ];
 const WELDER_TRACKING_MODES = ["MANUAL", "RFID", "MIXED", "DISABLED"];
 const machineControlState = new Map();
+const machineEngineeringState = new Map();
 
 function parseMachineId(rawId) {
   const machineId = Number.parseInt(rawId, 10);
@@ -792,6 +793,66 @@ function buildEmptyOverview(machine) {
     activeWelderSession: null,
     activeWelder: null,
   };
+}
+
+
+function getMachineEngineeringSetpoints(machineId) {
+  return (
+    machineEngineeringState.get(machineId) || {
+      acVoltageThresholds: {
+        acLow: null,
+        acLowLow: null,
+        acHigh: null,
+        acHighHigh: null,
+      },
+      temperatureThresholds: {
+        temp1H: null,
+        temp1HH: null,
+        temp2H: null,
+        temp2HH: null,
+        temp3H: null,
+        temp3HH: null,
+      },
+      parameterSettings: {
+        depositionCoefficient: null,
+        machineRatedCurrentLimit: null,
+        machineRatedCurrent: null,
+      },
+      fanAndWirefeed: {
+        normalFanPulsePerMin: null,
+        wireFeedPulseCount: null,
+      },
+      updatedAt: null,
+    }
+  );
+}
+
+function setMachineEngineeringSetpoints(machineId, updates) {
+  const current = getMachineEngineeringSetpoints(machineId);
+
+  const next = {
+    ...current,
+    acVoltageThresholds: {
+      ...current.acVoltageThresholds,
+      ...(updates.acVoltageThresholds || {}),
+    },
+    temperatureThresholds: {
+      ...current.temperatureThresholds,
+      ...(updates.temperatureThresholds || {}),
+    },
+    parameterSettings: {
+      ...current.parameterSettings,
+      ...(updates.parameterSettings || {}),
+    },
+    fanAndWirefeed: {
+      ...current.fanAndWirefeed,
+      ...(updates.fanAndWirefeed || {}),
+    },
+    updatedAt: new Date().toISOString(),
+  };
+
+  machineEngineeringState.set(machineId, next);
+  return next;
 }
 
 function getMachineControls(machineId) {
@@ -3356,6 +3417,108 @@ router.get("/machine/:id/production/timeline", async (req, res) => {
     return res.json(events);
   } catch (error) {
     return sendInternalError("Production timeline error", error, res);
+  }
+});
+
+
+router.get("/machine/:id/engineering/setpoints", async (req, res) => {
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
+
+    if (!machineIdentifier) {
+      return res.status(400).json({ error: "Machine identifier is required" });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: { id: true, machineCode: true },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
+      });
+    }
+
+    if (!(await canAccessMachine(req.user, machine.id))) {
+      return res.status(403).json({ error: "Machine access denied" });
+    }
+
+    return res.json({
+      machineId: machine.id,
+      machineCode: machine.machineCode,
+      setpoints: getMachineEngineeringSetpoints(machine.id),
+    });
+  } catch (error) {
+    return sendInternalError("Get engineering setpoints error", error, res);
+  }
+});
+
+router.post("/machine/:id/engineering/setpoints", async (req, res) => {
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
+
+    if (!machineIdentifier) {
+      return res.status(400).json({ error: "Machine identifier is required" });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: { id: true, machineCode: true },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
+      });
+    }
+
+    if (!(await canAccessMachine(req.user, machine.id))) {
+      return res.status(403).json({ error: "Machine access denied" });
+    }
+
+    const setpoints = setMachineEngineeringSetpoints(machine.id, req.body || {});
+
+    return res.json({
+      message: "Engineering setpoints saved",
+      machineId: machine.id,
+      machineCode: machine.machineCode,
+      setpoints,
+    });
+  } catch (error) {
+    return sendInternalError("Save engineering setpoints error", error, res);
+  }
+});
+
+router.post("/machine/:id/engineering/read-all", async (req, res) => {
+  try {
+    const machineIdentifier = parseMachineIdentifier(req.params.id);
+
+    if (!machineIdentifier) {
+      return res.status(400).json({ error: "Machine identifier is required" });
+    }
+
+    const machine = await findMachineByIdentifier(machineIdentifier, {
+      select: { id: true, machineCode: true },
+    });
+
+    if (!machine) {
+      return res.status(404).json({
+        error: `Machine with identifier ${machineIdentifier} not found`,
+      });
+    }
+
+    if (!(await canAccessMachine(req.user, machine.id))) {
+      return res.status(403).json({ error: "Machine access denied" });
+    }
+
+    return res.json({
+      message: "Read all setpoints requested",
+      machineId: machine.id,
+      machineCode: machine.machineCode,
+      setpoints: getMachineEngineeringSetpoints(machine.id),
+      note: "MQTT device command will be added in next phase.",
+    });
+  } catch (error) {
+    return sendInternalError("Read engineering setpoints error", error, res);
   }
 });
 
