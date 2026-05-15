@@ -8,9 +8,7 @@ const {
   recoverOpenArcStates,
 } = require("./welderSessions");
 
-const {
-  processTelemetryForProduction,
-} = require("./productionTelemetry");
+const { processTelemetryForProduction } = require("./productionTelemetry");
 
 let client = null;
 let demoTelemetryInterval = null;
@@ -46,7 +44,6 @@ function truncateForLog(value, maxLength = 500) {
 
 function parseNumber(value) {
   if (value === undefined || value === null || value === "") return null;
-
   const parsedValue = Number(value);
   return Number.isFinite(parsedValue) ? parsedValue : null;
 }
@@ -65,7 +62,6 @@ function parseOptionalBoolean(value) {
 
 function parseOptionalString(value) {
   if (value === undefined || value === null) return null;
-
   const parsedValue = String(value).trim();
   return parsedValue || null;
 }
@@ -75,29 +71,23 @@ function getFirstValidNumber(...values) {
     const parsedValue = parseNumber(value);
     if (parsedValue !== null) return parsedValue;
   }
-
   return null;
 }
 
 function deriveTemperature(...temperatures) {
   const validTemperatures = temperatures.filter((value) => value !== null);
-
   if (!validTemperatures.length) return null;
-
   return Math.max(...validTemperatures);
 }
 
 function buildMapUrl(gpsLat, gpsLng, mapUrl) {
   if (mapUrl) return mapUrl;
-
   if (gpsLat === null || gpsLng === null) return null;
-
   return `https://www.google.com/maps?q=${gpsLat},${gpsLng}`;
 }
 
 function parseTimestamp(value) {
   if (!value) return new Date();
-
   const timestamp = new Date(value);
   return Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
 }
@@ -135,10 +125,7 @@ function parseMachineIdentifier(payload, topic) {
 
   if (typeof topic === "string" && topic.startsWith(topicPrefix)) {
     const identifier = topic.slice(topicPrefix.length).trim();
-
-    if (identifier && !identifier.includes("/")) {
-      return identifier;
-    }
+    if (identifier && !identifier.includes("/")) return identifier;
   }
 
   return null;
@@ -158,6 +145,9 @@ function hasGpsPayload(payload) {
 function hasWeldingPayload(payload) {
   return hasTelemetryField(payload, [
     "inputVoltage",
+    "inputVoltageR",
+    "inputVoltageY",
+    "inputVoltageB",
     "outputVoltage",
     "outputCurrent",
     "temperature",
@@ -166,6 +156,7 @@ function hasWeldingPayload(payload) {
     "igbtTemperature",
     "heatSyncTemperature",
     "heatSinkTemperature",
+    "fanPulsePerMin",
     "arcOn",
     "machineOn",
     "readings",
@@ -258,8 +249,17 @@ function normalizeTelemetryPayload(payload, topic) {
 
     normalizedPayload.machineCode = normalizedPayload.machineCode || "WM-001";
 
+    normalizedPayload.trafoCoreTemperature =
+      normalizedPayload.trafoCoreTemperature ?? parseNumber(readings[0]);
+
+    normalizedPayload.igbtTemperature =
+      normalizedPayload.igbtTemperature ?? parseNumber(readings[1]);
+
+    normalizedPayload.heatSyncTemperature =
+      normalizedPayload.heatSyncTemperature ?? parseNumber(readings[2]);
+
     normalizedPayload.temperature =
-      normalizedPayload.temperature ?? parseNumber(readings[0]);
+      normalizedPayload.temperature ?? normalizedPayload.igbtTemperature;
 
     normalizedPayload.outputCurrent =
       normalizedPayload.outputCurrent ?? parseNumber(readings[3]);
@@ -267,14 +267,40 @@ function normalizeTelemetryPayload(payload, topic) {
     normalizedPayload.outputVoltage =
       normalizedPayload.outputVoltage ?? parseNumber(readings[5]);
 
+    normalizedPayload.currentSetting =
+      normalizedPayload.currentSetting ?? parseNumber(readings[7]);
+
+    normalizedPayload.inputVoltageR =
+      normalizedPayload.inputVoltageR ?? parseNumber(readings[9]);
+
+    normalizedPayload.inputVoltageY =
+      normalizedPayload.inputVoltageY ?? parseNumber(readings[10]);
+
+    normalizedPayload.inputVoltageB =
+      normalizedPayload.inputVoltageB ?? parseNumber(readings[11]);
+
+    normalizedPayload.fanPulsePerMin =
+      normalizedPayload.fanPulsePerMin ?? parseNumber(readings[12]);
+
     normalizedPayload.inputVoltage =
-      normalizedPayload.inputVoltage ?? parseNumber(readings[9]);
+      normalizedPayload.inputVoltage ??
+      Math.max(
+        normalizedPayload.inputVoltageR || 0,
+        normalizedPayload.inputVoltageY || 0,
+        normalizedPayload.inputVoltageB || 0
+      );
 
-    normalizedPayload.trafoCoreTemperature =
-      normalizedPayload.trafoCoreTemperature ?? parseNumber(readings[1]);
+    normalizedPayload.machineOn =
+      normalizedPayload.machineOn ??
+      (
+        (normalizedPayload.inputVoltageR || 0) > 100 ||
+        (normalizedPayload.inputVoltageY || 0) > 100 ||
+        (normalizedPayload.inputVoltageB || 0) > 100 ||
+        (normalizedPayload.fanPulsePerMin || 0) > 0
+      );
 
-    normalizedPayload.igbtTemperature =
-      normalizedPayload.igbtTemperature ?? parseNumber(readings[2]);
+    normalizedPayload.arcOn =
+      normalizedPayload.arcOn ?? (normalizedPayload.outputCurrent || 0) > 15;
   }
 
   normalizedPayload.gpsLat =
@@ -317,7 +343,6 @@ function normalizeTelemetryPayload(payload, topic) {
   const rawGpsFix = parseOptionalBoolean(normalizedPayload.gpsFix);
   const gpsLat = parseNumber(normalizedPayload.gpsLat);
   const gpsLng = parseNumber(normalizedPayload.gpsLng);
-
   const gpsFix = rawGpsFix ?? (gpsLat !== null && gpsLng !== null ? true : null);
 
   const mapUrl = buildMapUrl(
@@ -329,16 +354,16 @@ function normalizeTelemetryPayload(payload, topic) {
   const arcOn =
     normalizedPayload.arcOn === undefined || normalizedPayload.arcOn === null
       ? outputCurrent !== null
-        ? outputCurrent > 5
+        ? outputCurrent > 15
         : false
       : parseBoolean(normalizedPayload.arcOn);
 
   const machineOn =
     normalizedPayload.machineOn === undefined || normalizedPayload.machineOn === null
       ? Boolean(
-          (inputVoltage !== null && inputVoltage > 50) ||
+          (inputVoltage !== null && inputVoltage > 100) ||
           (outputVoltage !== null && outputVoltage > 10) ||
-          (outputCurrent !== null && outputCurrent > 5)
+          (outputCurrent !== null && outputCurrent > 15)
         )
       : parseOptionalBoolean(normalizedPayload.machineOn);
 
@@ -441,6 +466,7 @@ async function persistTelemetry(telemetry) {
     machineId: savedTelemetry.machineId,
     outputCurrent: savedTelemetry.outputCurrent,
     outputVoltage: savedTelemetry.outputVoltage,
+    inputVoltage: savedTelemetry.inputVoltage,
     arcOn: savedTelemetry.arcOn,
     machineOn: savedTelemetry.machineOn,
     elapsedMs: Date.now() - startedAt,
@@ -551,7 +577,7 @@ async function generateFleetTelemetry() {
       trafoCoreTemperature: 50 + Math.random() * 40,
       igbtTemperature: 45 + Math.random() * 35,
       heatSyncTemperature: 40 + Math.random() * 30,
-      machineOn: isWelding,
+      machineOn: true,
       arcOn: isWelding,
     };
   });
@@ -611,23 +637,19 @@ function startMqttSubscription() {
 
     console.log(`[mqtt] connected to ${config.mqttBrokerUrl} as ${config.mqttClientId}`);
 
-    client.subscribe(
-      config.mqttTopic,
-      { qos: config.mqttSubscribeQos },
-      (error) => {
-        if (error) {
-          mqttState.lastError = error.message || String(error);
-          console.error(`[mqtt] subscribe error for ${config.mqttTopic}:`, error);
-          return;
-        }
-
-        mqttState.subscribedTopic = config.mqttTopic;
-
-        console.log(
-          `[mqtt] subscribed to topic ${config.mqttTopic} with qos ${config.mqttSubscribeQos}`
-        );
+    client.subscribe(config.mqttTopic, { qos: config.mqttSubscribeQos }, (error) => {
+      if (error) {
+        mqttState.lastError = error.message || String(error);
+        console.error(`[mqtt] subscribe error for ${config.mqttTopic}:`, error);
+        return;
       }
-    );
+
+      mqttState.subscribedTopic = config.mqttTopic;
+
+      console.log(
+        `[mqtt] subscribed to topic ${config.mqttTopic} with qos ${config.mqttSubscribeQos}`
+      );
+    });
   });
 
   client.on("message", (topic, message) => {
