@@ -1,11 +1,13 @@
 const mqtt = require("mqtt");
 const prisma = require("./db");
 const config = require("./config");
+
 const {
   processMqttTelemetryForWelderArcEvents,
   updateActiveWelderSessionFromTelemetry,
   recoverOpenArcStates,
 } = require("./welderSessions");
+
 const {
   processTelemetryForProduction,
 } = require("./productionTelemetry");
@@ -13,6 +15,7 @@ const {
 let client = null;
 let demoTelemetryInterval = null;
 let isStarted = false;
+
 const mqttState = {
   enabled: config.enableMqtt,
   connected: false,
@@ -38,14 +41,139 @@ function getPayloadKeys(payload) {
 
 function truncateForLog(value, maxLength = 500) {
   const text = String(value);
-
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
-function summarizeTelemetry(telemetry) {
-  if (!telemetry) {
-    return null;
+function parseNumber(value) {
+  if (value === undefined || value === null || value === "") return null;
+
+  const parsedValue = Number(value);
+  return Number.isFinite(parsedValue) ? parsedValue : null;
+}
+
+function parseBoolean(value) {
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return null;
+}
+
+function parseOptionalBoolean(value) {
+  if (value === undefined || value === null || value === "") return null;
+  return parseBoolean(value);
+}
+
+function parseOptionalString(value) {
+  if (value === undefined || value === null) return null;
+
+  const parsedValue = String(value).trim();
+  return parsedValue || null;
+}
+
+function getFirstValidNumber(...values) {
+  for (const value of values) {
+    const parsedValue = parseNumber(value);
+    if (parsedValue !== null) return parsedValue;
   }
+
+  return null;
+}
+
+function deriveTemperature(...temperatures) {
+  const validTemperatures = temperatures.filter((value) => value !== null);
+
+  if (!validTemperatures.length) return null;
+
+  return Math.max(...validTemperatures);
+}
+
+function buildMapUrl(gpsLat, gpsLng, mapUrl) {
+  if (mapUrl) return mapUrl;
+
+  if (gpsLat === null || gpsLng === null) return null;
+
+  return `https://www.google.com/maps?q=${gpsLat},${gpsLng}`;
+}
+
+function parseTimestamp(value) {
+  if (!value) return new Date();
+
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
+}
+
+function parseDateTimePayload(payload) {
+  const datePart = parseOptionalString(payload.Date);
+  const timePart = parseOptionalString(payload.Time);
+  const combinedDateTime = parseOptionalString(payload.time_date);
+
+  if (combinedDateTime) return combinedDateTime;
+  if (datePart && timePart) return `${datePart} ${timePart}`;
+
+  return payload.timestamp;
+}
+
+function parseMachineIdentifier(payload, topic) {
+  if (topic === "machine/data/M_data") {
+    console.log("[mqtt] TEMP mapping M_data → WM-001");
+    return "WM-001";
+  }
+
+  if (
+    payload?.machineCode !== undefined &&
+    payload?.machineCode !== null &&
+    String(payload.machineCode).trim() !== ""
+  ) {
+    return String(payload.machineCode).trim();
+  }
+
+  if (payload?.machineId !== undefined && payload?.machineId !== null) {
+    return String(payload.machineId).trim();
+  }
+
+  const topicPrefix = "machine/data/";
+
+  if (typeof topic === "string" && topic.startsWith(topicPrefix)) {
+    const identifier = topic.slice(topicPrefix.length).trim();
+
+    if (identifier && !identifier.includes("/")) {
+      return identifier;
+    }
+  }
+
+  return null;
+}
+
+function hasTelemetryField(payload, fields) {
+  return fields.some((field) => {
+    const value = payload[field];
+    return value !== undefined && value !== null && value !== "";
+  });
+}
+
+function hasGpsPayload(payload) {
+  return hasTelemetryField(payload, ["gpsLat", "gpsLng", "lat", "lon"]);
+}
+
+function hasWeldingPayload(payload) {
+  return hasTelemetryField(payload, [
+    "inputVoltage",
+    "outputVoltage",
+    "outputCurrent",
+    "temperature",
+    "trafoCoreTemperature",
+    "transformerCoreTemperature",
+    "igbtTemperature",
+    "heatSyncTemperature",
+    "heatSinkTemperature",
+    "arcOn",
+    "machineOn",
+    "readings",
+  ]);
+}
+
+function summarizeTelemetry(telemetry) {
+  if (!telemetry) return null;
 
   return {
     machineIdentifier: telemetry.machineIdentifier,
@@ -65,75 +193,6 @@ function summarizeTelemetry(telemetry) {
     gpsLng: telemetry.gpsLng,
     hasMapUrl: Boolean(telemetry.mapUrl),
   };
-}
-
-function parseNumber(value) {
-  if (value === undefined || value === null || value === "") {
-    return null;
-  }
-
-  const parsedValue = Number(value);
-
-  return Number.isFinite(parsedValue) ? parsedValue : null;
-}
-
-function parseMachineIdentifierFromTopic(topic) {
-  if (typeof topic !== "string") {
-    return null;
-  }
-
-  const topicPrefix = "machine/data/";
-
-  if (!topic.startsWith(topicPrefix)) {
-    return null;
-  }
-
-  const machineIdentifier = topic.slice(topicPrefix.length).trim();
-
-  return machineIdentifier && !machineIdentifier.includes("/")
-    ? machineIdentifier
-    : null;
-}
-
-function parseMachineIdentifier(payload, topic) {
-  // 🔴 TEMP FIX FOR BARODA MACHINE (5 days only)
-  if (topic === "machine/data/M_data") {
-    console.log("[mqtt] TEMP mapping M_data → WM-001");
-    return "WM-001"; // 👈 change if your machine code is different
-  }
-
-  // ✅ Priority 1: machineCode from payload
-  if (
-    payload &&
-    payload.machineCode !== undefined &&
-    payload.machineCode !== null &&
-    String(payload.machineCode).trim() !== ""
-  ) {
-    return String(payload.machineCode).trim();
-  }
-
-  // ✅ Priority 2: machineId from payload
-  if (
-    payload &&
-    payload.machineId !== undefined &&
-    payload.machineId !== null
-  ) {
-    return String(payload.machineId).trim();
-  }
-
-  // ✅ Priority 3: topic-based extraction (normal flow)
-  const topicPrefix = "machine/data/";
-
-  if (typeof topic === "string" && topic.startsWith(topicPrefix)) {
-    const identifier = topic.slice(topicPrefix.length).trim();
-
-    if (identifier && !identifier.includes("/")) {
-      return identifier;
-    }
-  }
-
-  // ❌ If nothing works
-  return null;
 }
 
 async function findMachineByIdentifier(machineIdentifier) {
@@ -160,11 +219,6 @@ async function findMachineByIdentifier(machineIdentifier) {
       });
       return machineById;
     }
-
-    console.warn("[mqtt] machine lookup by id returned no result", {
-      machineIdentifier,
-      numericMachineId,
-    });
   }
 
   const machineByCode = await prisma.machine.findFirst({
@@ -187,131 +241,6 @@ async function findMachineByIdentifier(machineIdentifier) {
   return machineByCode;
 }
 
-function parseBoolean(value) {
-  if (typeof value === "boolean") {
-    return value;
-  }
-
-  if (value === "true") {
-    return true;
-  }
-
-  if (value === "false") {
-    return false;
-  }
-
-  return null;
-}
-
-function parseOptionalBoolean(value) {
-  if (value === undefined || value === null || value === "") {
-    return null;
-  }
-
-  return parseBoolean(value);
-}
-
-function parseOptionalString(value) {
-  if (value === undefined || value === null) {
-    return null;
-  }
-
-  const parsedValue = String(value).trim();
-
-  return parsedValue || null;
-}
-
-function buildMapUrl(gpsLat, gpsLng, mapUrl) {
-  if (mapUrl) {
-    return mapUrl;
-  }
-
-  if (gpsLat === null || gpsLng === null) {
-    return null;
-  }
-
-  return `https://www.google.com/maps?q=${gpsLat},${gpsLng}`;
-}
-
-function parseTimestamp(value) {
-  if (!value) {
-    return new Date();
-  }
-
-  const timestamp = new Date(value);
-
-  return Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
-}
-
-function hasOwnValue(payload, key) {
-  return Object.prototype.hasOwnProperty.call(payload, key);
-}
-
-function getFirstValidNumber(...values) {
-  for (const value of values) {
-    const parsedValue = parseNumber(value);
-
-    if (parsedValue !== null) {
-      return parsedValue;
-    }
-  }
-
-  return null;
-}
-
-function deriveTemperature(...temperatures) {
-  const validTemperatures = temperatures.filter((value) => value !== null);
-
-  if (!validTemperatures.length) {
-    return null;
-  }
-
-  return Math.max(...validTemperatures);
-}
-
-function hasTelemetryField(payload, fields) {
-  return fields.some((field) => {
-    const value = payload[field];
-
-    return value !== undefined && value !== null && value !== "";
-  });
-}
-
-function hasGpsPayload(payload) {
-  return hasTelemetryField(payload, ["gpsLat", "gpsLng", "lat", "lon"]);
-}
-
-function hasWeldingPayload(payload) {
-  return hasTelemetryField(payload, [
-    "inputVoltage",
-    "outputVoltage",
-    "outputCurrent",
-    "temperature",
-    "trafoCoreTemperature",
-    "transformerCoreTemperature",
-    "igbtTemperature",
-    "heatSyncTemperature",
-    "heatSinkTemperature",
-    "arcOn",
-  ]);
-}
-
-function parseDateTimePayload(payload) {
-  const datePart = parseOptionalString(payload.Date);
-  const timePart = parseOptionalString(payload.Time);
-  const combinedDateTime = parseOptionalString(payload.time_date);
-
-  if (combinedDateTime) {
-    return combinedDateTime;
-  }
-
-  if (datePart && timePart) {
-    return `${datePart} ${timePart}`;
-  }
-
-  return payload.timestamp;
-}
-
 function normalizeTelemetryPayload(payload, topic) {
   console.log("[mqtt] normalizing telemetry payload", {
     topic,
@@ -321,6 +250,7 @@ function normalizeTelemetryPayload(payload, topic) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Payload must be a JSON object");
   }
+
   const normalizedPayload = { ...payload };
 
   if (Array.isArray(normalizedPayload.readings)) {
@@ -328,50 +258,53 @@ function normalizeTelemetryPayload(payload, topic) {
 
     normalizedPayload.machineCode = normalizedPayload.machineCode || "WM-001";
 
-    normalizedPayload.inputVoltage =
-      normalizedPayload.inputVoltage ?? parseNumber(readings[9]);
-    normalizedPayload.outputVoltage =
-      normalizedPayload.outputVoltage ?? parseNumber(readings[5]);
-    normalizedPayload.outputCurrent =
-      normalizedPayload.outputCurrent ?? parseNumber(readings[3]);
     normalizedPayload.temperature =
       normalizedPayload.temperature ?? parseNumber(readings[0]);
+
+    normalizedPayload.outputCurrent =
+      normalizedPayload.outputCurrent ?? parseNumber(readings[3]);
+
+    normalizedPayload.outputVoltage =
+      normalizedPayload.outputVoltage ?? parseNumber(readings[5]);
+
+    normalizedPayload.inputVoltage =
+      normalizedPayload.inputVoltage ?? parseNumber(readings[9]);
+
+    normalizedPayload.trafoCoreTemperature =
+      normalizedPayload.trafoCoreTemperature ?? parseNumber(readings[1]);
+
+    normalizedPayload.igbtTemperature =
+      normalizedPayload.igbtTemperature ?? parseNumber(readings[2]);
   }
 
   normalizedPayload.gpsLat =
     normalizedPayload.gpsLat ?? parseNumber(normalizedPayload.lat);
+
   normalizedPayload.gpsLng =
     normalizedPayload.gpsLng ?? parseNumber(normalizedPayload.lon);
 
   const machineIdentifier = parseMachineIdentifier(normalizedPayload, topic);
 
   if (!machineIdentifier) {
-    throw new Error(
-      "machineId, machineCode, or machine topic suffix is required"
-    );
+    throw new Error("machineId, machineCode, or machine topic suffix is required");
   }
 
   const inputVoltage = parseNumber(normalizedPayload.inputVoltage);
   const outputVoltage = parseNumber(normalizedPayload.outputVoltage);
   const outputCurrent = parseNumber(normalizedPayload.outputCurrent);
+
   const trafoCoreTemperature = getFirstValidNumber(
     normalizedPayload.trafoCoreTemperature,
     normalizedPayload.transformerCoreTemperature
   );
+
   const igbtTemperature = parseNumber(normalizedPayload.igbtTemperature);
+
   const heatSyncTemperature = getFirstValidNumber(
     normalizedPayload.heatSyncTemperature,
     normalizedPayload.heatSinkTemperature
   );
-  const rawGpsFix = parseOptionalBoolean(normalizedPayload.gpsFix);
-  const gpsLat = parseNumber(normalizedPayload.gpsLat);
-  const gpsLng = parseNumber(normalizedPayload.gpsLng);
-  const mapUrl = buildMapUrl(
-    gpsLat,
-    gpsLng,
-    parseOptionalString(normalizedPayload.mapUrl)
-  );
-  const gpsFix = rawGpsFix ?? (gpsLat !== null && gpsLng !== null ? true : null);
+
   const temperature = getFirstValidNumber(
     normalizedPayload.temperature,
     deriveTemperature(
@@ -380,18 +313,35 @@ function normalizeTelemetryPayload(payload, topic) {
       heatSyncTemperature
     )
   );
+
+  const rawGpsFix = parseOptionalBoolean(normalizedPayload.gpsFix);
+  const gpsLat = parseNumber(normalizedPayload.gpsLat);
+  const gpsLng = parseNumber(normalizedPayload.gpsLng);
+
+  const gpsFix = rawGpsFix ?? (gpsLat !== null && gpsLng !== null ? true : null);
+
+  const mapUrl = buildMapUrl(
+    gpsLat,
+    gpsLng,
+    parseOptionalString(normalizedPayload.mapUrl)
+  );
+
   const arcOn =
     normalizedPayload.arcOn === undefined || normalizedPayload.arcOn === null
       ? outputCurrent !== null
-        ? outputCurrent > 10
-        : null
+        ? outputCurrent > 5
+        : false
       : parseBoolean(normalizedPayload.arcOn);
+
   const machineOn =
     normalizedPayload.machineOn === undefined || normalizedPayload.machineOn === null
-      ? inputVoltage !== null
-        ? inputVoltage > 50
-        : null
+      ? Boolean(
+          (inputVoltage !== null && inputVoltage > 50) ||
+          (outputVoltage !== null && outputVoltage > 10) ||
+          (outputCurrent !== null && outputCurrent > 5)
+        )
       : parseOptionalBoolean(normalizedPayload.machineOn);
+
   const containsWeldingData = hasWeldingPayload(normalizedPayload);
   const containsGpsData = hasGpsPayload(normalizedPayload);
   const isGpsOnly = containsGpsData && !containsWeldingData;
@@ -455,25 +405,16 @@ function normalizeTelemetryPayload(payload, topic) {
 
 async function persistTelemetry(telemetry) {
   const startedAt = Date.now();
+
   console.log("[mqtt] telemetry persistence started", summarizeTelemetry(telemetry));
 
   const machine = await findMachineByIdentifier(telemetry.machineIdentifier);
 
   if (!machine) {
-    throw new Error(
-      `Machine not found for identifier ${telemetry.machineIdentifier}`
-    );
+    throw new Error(`Machine not found for identifier ${telemetry.machineIdentifier}`);
   }
 
-  console.log(
-    `[mqtt] machine resolved ${telemetry.machineIdentifier} -> id ${machine.id}`
-  );
-
-  console.log("[mqtt] creating telemetry row", {
-    machineId: machine.id,
-    machineCode: machine.machineCode,
-    telemetry: summarizeTelemetry(telemetry),
-  });
+  console.log(`[mqtt] machine resolved ${telemetry.machineIdentifier} -> id ${machine.id}`);
 
   const savedTelemetry = await prisma.telemetry.create({
     data: {
@@ -498,23 +439,22 @@ async function persistTelemetry(telemetry) {
   console.log("[mqtt] telemetry row created", {
     telemetryId: savedTelemetry.id,
     machineId: savedTelemetry.machineId,
-    createdAt: savedTelemetry.createdAt,
+    outputCurrent: savedTelemetry.outputCurrent,
+    outputVoltage: savedTelemetry.outputVoltage,
+    arcOn: savedTelemetry.arcOn,
+    machineOn: savedTelemetry.machineOn,
     elapsedMs: Date.now() - startedAt,
-  });
-
-  console.log("[mqtt] updating active welder session from telemetry", {
-    telemetryId: savedTelemetry.id,
-    machineId: savedTelemetry.machineId,
   });
 
   await updateActiveWelderSessionFromTelemetry(savedTelemetry);
   await processMqttTelemetryForWelderArcEvents(savedTelemetry);
+
   const productionResult = await processTelemetryForProduction(savedTelemetry);
 
-  console.log("[mqtt] active welder session update completed", {
+  console.log("[mqtt] production update completed", {
     telemetryId: savedTelemetry.id,
     machineId: savedTelemetry.machineId,
-    productionState: productionResult.state,
+    productionState: productionResult?.state,
     elapsedMs: Date.now() - startedAt,
   });
 
@@ -530,6 +470,7 @@ async function handleIncomingMessage(topic, message) {
 
   try {
     payload = JSON.parse(rawMessage);
+
     console.log("[mqtt] MQTT received", {
       topic,
       byteLength: message.length,
@@ -550,7 +491,7 @@ async function handleIncomingMessage(topic, message) {
     const telemetry = normalizeTelemetryPayload(payload, topic);
 
     if (telemetry.isGpsOnly) {
-      console.log("[mqtt] GPS-only payload normalized; skipping welding telemetry save", {
+      console.log("[mqtt] GPS-only payload normalized; skipping save", {
         topic,
         telemetry: summarizeTelemetry(telemetry),
       });
@@ -558,14 +499,15 @@ async function handleIncomingMessage(topic, message) {
     }
 
     const result = await persistTelemetry(telemetry);
+
     console.log(
-      `[mqtt] telemetry saved for ${result.machine.machineCode} (id ${result.machine.id}) from topic ${topic}`
+      `[mqtt] telemetry saved for ${result.machine.machineCode} id ${result.machine.id} from topic ${topic}`
     );
   } catch (error) {
     mqttState.lastError = error.message || String(error);
 
     if (String(error.message || "").startsWith("Machine not found")) {
-      console.error("[mqtt] machine lookup failed while processing telemetry", {
+      console.error("[mqtt] machine lookup failed", {
         topic,
         payloadKeys: getPayloadKeys(payload),
         machineIdentifier: parseMachineIdentifier(payload, topic),
@@ -595,6 +537,7 @@ async function generateFleetTelemetry() {
   }
 
   const timestamp = new Date();
+
   const rows = machines.map((machine) => {
     const isWelding = Math.random() > 0.5;
 
@@ -608,6 +551,7 @@ async function generateFleetTelemetry() {
       trafoCoreTemperature: 50 + Math.random() * 40,
       igbtTemperature: 45 + Math.random() * 35,
       heatSyncTemperature: 40 + Math.random() * 30,
+      machineOn: isWelding,
       arcOn: isWelding,
     };
   });
@@ -620,9 +564,7 @@ async function generateFleetTelemetry() {
 }
 
 function startDemoTelemetry() {
-  if (!config.enableDemoTelemetry || demoTelemetryInterval) {
-    return;
-  }
+  if (!config.enableDemoTelemetry || demoTelemetryInterval) return;
 
   console.warn(
     `Demo telemetry generation is enabled every ${config.demoTelemetryIntervalMs} ms`
@@ -643,9 +585,7 @@ function startDemoTelemetry() {
 
 function startMqttSubscription() {
   if (!config.enableMqtt) {
-    console.log(
-      "[mqtt] ingestion disabled by configuration (set ENABLE_MQTT=true to enable it)"
-    );
+    console.log("[mqtt] ingestion disabled. Set ENABLE_MQTT=true to enable.");
     return;
   }
 
@@ -655,7 +595,6 @@ function startMqttSubscription() {
   }
 
   client = mqtt.connect(config.mqttBrokerUrl, {
-    // A stable client ID lets Mosquitto track this backend across reconnects.
     clientId: config.mqttClientId,
     connectTimeout: config.mqttConnectTimeoutMs,
     reconnectPeriod: config.mqttReconnectPeriodMs,
@@ -669,9 +608,8 @@ function startMqttSubscription() {
   client.on("connect", () => {
     mqttState.connected = true;
     mqttState.lastError = null;
-    console.log(
-      `[mqtt] connected to ${config.mqttBrokerUrl} as ${config.mqttClientId}`
-    );
+
+    console.log(`[mqtt] connected to ${config.mqttBrokerUrl} as ${config.mqttClientId}`);
 
     client.subscribe(
       config.mqttTopic,
@@ -684,6 +622,7 @@ function startMqttSubscription() {
         }
 
         mqttState.subscribedTopic = config.mqttTopic;
+
         console.log(
           `[mqtt] subscribed to topic ${config.mqttTopic} with qos ${config.mqttSubscribeQos}`
         );
@@ -697,9 +636,7 @@ function startMqttSubscription() {
 
   client.on("reconnect", () => {
     mqttState.connected = false;
-    console.warn(
-      `[mqtt] reconnecting in ${config.mqttReconnectPeriodMs} ms...`
-    );
+    console.warn(`[mqtt] reconnecting in ${config.mqttReconnectPeriodMs} ms...`);
   });
 
   client.on("offline", () => {
@@ -724,9 +661,7 @@ function startMqttSubscription() {
 }
 
 async function startTelemetryService() {
-  if (isStarted) {
-    return;
-  }
+  if (isStarted) return;
 
   isStarted = true;
 
@@ -736,7 +671,6 @@ async function startTelemetryService() {
     console.error("[mqtt] failed to recover open arc state:", error);
   }
 
-  // MQTT startup is isolated so broker issues never prevent the API from serving traffic.
   try {
     startMqttSubscription();
   } catch (error) {
@@ -763,6 +697,7 @@ async function stopTelemetryService() {
 
     mqttState.connected = false;
     mqttState.subscribedTopic = null;
+
     console.log("[mqtt] client stopped");
   }
 
