@@ -267,6 +267,7 @@ function normalizeTelemetryPayload(payload, topic) {
 
   if (Array.isArray(normalizedPayload.readings)) {
     const readings = normalizedPayload.readings;
+    console.log("[mqtt] raw readings", readings);
 
     normalizedPayload.machineCode = normalizedPayload.machineCode || "WM-001";
 
@@ -292,13 +293,13 @@ function normalizeTelemetryPayload(payload, topic) {
       normalizedPayload.currentSetting ?? parseNumber(readings[7]);
 
     normalizedPayload.inputVoltageR =
-      normalizedPayload.inputVoltageR ?? parseNumber(readings[9]);
+      normalizedPayload.inputVoltageR ?? ((parseNumber(readings[6]) || 0) * 2);
 
     normalizedPayload.inputVoltageY =
-      normalizedPayload.inputVoltageY ?? parseNumber(readings[10]);
+      normalizedPayload.inputVoltageY ?? ((parseNumber(readings[8]) || 0) * 2);
 
     normalizedPayload.inputVoltageB =
-      normalizedPayload.inputVoltageB ?? parseNumber(readings[11]);
+      normalizedPayload.inputVoltageB ?? ((parseNumber(readings[8]) || 0) * 2);
 
     normalizedPayload.fanPulsePerMin =
       normalizedPayload.fanPulsePerMin ?? parseNumber(readings[12]);

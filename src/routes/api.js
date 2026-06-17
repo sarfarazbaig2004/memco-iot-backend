@@ -1451,7 +1451,7 @@ router.get("/machines/overview", async (req, res) => {
       orderBy: { id: "asc" },
       select: {
         id: true, machineCode: true, serialNumber: true, location: true,
-        telemetry: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1, select: { arcOn: true, timestamp: true, createdAt: true, inputVoltage: true, outputCurrent: true, temperature: true, trafoCoreTemperature: true, igbtTemperature: true, heatSyncTemperature: true, machineOn: true, gpsFix: true, gpsLat: true, gpsLng: true, mapUrl: true } },
+        telemetry: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1, select: { arcOn: true, timestamp: true, createdAt: true, inputVoltage: true, outputVoltage: true, outputCurrent: true, temperature: true, trafoCoreTemperature: true, igbtTemperature: true, heatSyncTemperature: true, machineOn: true, gpsFix: true, gpsLat: true, gpsLng: true, mapUrl: true } },
         welderSessions: { where: { status: "ACTIVE", endedAt: null }, orderBy: { startedAt: "desc" }, take: 1, include: { welder: true, machine: { include: { telemetry: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 } } } } },
       },
     });
@@ -1472,7 +1472,7 @@ router.get("/machines/overview", async (req, res) => {
         id: machine.id, machineId: machine.id, code: machine.machineCode, machineCode: machine.machineCode, serialNumber: machine.serialNumber || "", location: machine.location || "Shop Floor",
         status, health, healthLabel: getHealthLabel(health), isLive: true,
         lastSeen: getTelemetryTime(latest), lastUpdatedAt: getTelemetryTime(latest), secondsSinceLastTelemetry: getSecondsSinceLastTelemetry(latest),
-        current: latest?.outputCurrent || 0, outputCurrent: latest?.outputCurrent || 0,
+        current: latest?.outputCurrent || 0, outputCurrent: latest?.outputCurrent || 0, voltage: latest?.outputVoltage || 0, outputVoltage: latest?.outputVoltage || 0,
         temperature, trafoCoreTemperature: latest?.trafoCoreTemperature ?? temperature, igbtTemperature: latest?.igbtTemperature ?? temperature, heatSyncTemperature: latest?.heatSyncTemperature ?? temperature,
         ...gps, warningCount: warnings.length, alarmCount: alarms.length, warnings, alarms,
         welder: activeSession?.welder?.name || "Unknown", activeWelderSession: formatWelderSession(activeSession),
