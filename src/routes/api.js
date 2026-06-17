@@ -1431,7 +1431,7 @@ router.get("/machine/:id/overview", async (req, res) => {
       weldingCurrent: isFresh ? Math.min(Math.max(telemetry.outputCurrent || 0, 0), 400) : 0,
       weldingVoltage: isFresh ? Math.min(Math.max(telemetry.outputVoltage || 0, 0), 100) : 0,
       currentSetting: controls.currentSetting, fanSpeed: 0,
-      inputVoltage: { R: isFresh ? Math.min(Math.max(telemetry.inputVoltage || 0, 0), 100) : 0, Y: isFresh ? Math.min(Math.max(telemetry.inputVoltage || 0, 0), 100) : 0, B: isFresh ? Math.min(Math.max(telemetry.inputVoltage || 0, 0), 100) : 0 },
+      inputVoltage: { R: isFresh ? Math.min(Math.max(telemetry.inputVoltage || 0, 0), 500) : 0, Y: isFresh ? Math.min(Math.max(telemetry.inputVoltage || 0, 0), 500) : 0, B: isFresh ? Math.min(Math.max(telemetry.inputVoltage || 0, 0), 500) : 0 },
       temperatures, alarms, warnings, trend,
       runningJob: telemetry.runningJob || { arcTime: "0:0:0", idleTime: "0:0:0", dcEnergy: 0, deposition: 0, wireFeedMeter: 0, arcCount: 0 },
       lifetime: telemetry.machineLifetime || { arcTime: "0:0:0", idleTime: "0:0:0", dcEnergy: 0, deposition: 0, wireFeedMeter: 0, arcCount: 0 },
