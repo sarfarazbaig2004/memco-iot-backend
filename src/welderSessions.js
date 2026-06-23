@@ -158,6 +158,32 @@ async function findActiveRfidSession(tx, machineId, telemetryTime) {
   });
 }
 
+async function getWelderSnapshotForTelemetry(tx, machineId, telemetryTime) {
+  const machine = await tx.machine.findUnique({
+    where: { id: machineId },
+    select: { welderTrackingMode: true },
+  });
+
+  if (!machine || machine.welderTrackingMode === WELDER_TRACKING_DISABLED) {
+    return buildWelderArcSnapshot(null);
+  }
+
+  if (machine.welderTrackingMode === "RFID") {
+    return buildRfidWelderArcSnapshot(
+      await findActiveRfidSession(tx, machineId, telemetryTime)
+    );
+  }
+
+  if (machine.welderTrackingMode === "MIXED") {
+    const rfidSession = await findActiveRfidSession(tx, machineId, telemetryTime);
+    if (rfidSession) return buildRfidWelderArcSnapshot(rfidSession);
+  }
+
+  return buildWelderArcSnapshot(
+    await findActiveAssignment(tx, machineId, telemetryTime)
+  );
+}
+
 function getNumericTelemetryValue(value) {
   const parsedValue = Number(value);
 
@@ -166,15 +192,15 @@ function getNumericTelemetryValue(value) {
 
 function isAboveStartThresholds(sample) {
   return (
-    sample.current > config.arcStartCurrentThreshold &&
-    sample.voltage > config.arcStartVoltageThreshold
+    sample.arcOn === true ||
+    sample.current > config.arcStartCurrentThreshold
   );
 }
 
 function isAboveEndThresholds(sample) {
   return (
-    sample.current > config.arcEndCurrentThreshold &&
-    sample.voltage > config.arcEndVoltageThreshold
+    sample.arcOn === true ||
+    sample.current > config.arcEndCurrentThreshold
   );
 }
 
@@ -668,6 +694,7 @@ async function processMqttTelemetryForWelderArcEvents(telemetry) {
     timestamp: telemetryTime,
     current: getNumericTelemetryValue(telemetry.outputCurrent),
     voltage: getNumericTelemetryValue(telemetry.outputVoltage),
+    arcOn: telemetry.arcOn === true,
   };
   const state = activeArcStates.get(telemetry.machineId);
   const aboveStartThresholds = isAboveStartThresholds(sample);

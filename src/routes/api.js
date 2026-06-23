@@ -600,11 +600,14 @@ function buildCustomerAccessPayload(customer, allMachines = false) {
 
 function formatWelderSession(session) {
   if (!session) return null;
-  const latestTelemetry = session.machine?.telemetry?.[0] || null;
+  const latestTelemetry = session.machine?.latestTelemetry || session.machine?.telemetry?.[0] || null;
+  const machineStatus = getMachineStatus(latestTelemetry);
+  const isWelding = machineStatus === "WELDING";
 
   return {
     id: session.id,
-    status: session.status,
+    status: machineStatus,
+    assignmentStatus: session.status,
     rfidCardNo: session.rfidCardNo,
     startedAt: session.startedAt,
     endedAt: session.endedAt,
@@ -616,8 +619,8 @@ function formatWelderSession(session) {
     energy: session.energy,
     deposition: session.deposition,
     arcCount: session.arcCount,
-    current: latestTelemetry?.outputCurrent || 0,
-    voltage: latestTelemetry?.outputVoltage || 0,
+    current: isWelding ? latestTelemetry?.outputCurrent || 0 : 0,
+    voltage: isWelding ? latestTelemetry?.outputVoltage || 0 : 0,
     inputVoltage: latestTelemetry?.inputVoltage || 0,
     temperature: deriveTelemetryTemperature(latestTelemetry),
     trafoCoreTemperature: latestTelemetry?.trafoCoreTemperature ?? null,
@@ -646,10 +649,20 @@ function formatWelderSession(session) {
 
 function formatWelderSessionForUser(session, user) {
   const formattedSession = formatWelderSession(session);
-  if (!formattedSession || isSuperAdmin(user)) return formattedSession;
+  if (!formattedSession || hasFullAccess(user)) return formattedSession;
 
-  // Filter out sensitive/internal telemetry for standard users
-  const { current: _, voltage: _2, inputVoltage: _3, temperature: _4, trafoCoreTemperature: _5, igbtTemperature: _6, heatSyncTemperature: _7, telemetryAt: _8, energy: _9, deposition: _10, idleTimeSeconds: _11, idleTime: _12, arcCount: _13, ...customerSession } = formattedSession;
+  const {
+    inputVoltage: _inputVoltage,
+    temperature: _temperature,
+    trafoCoreTemperature: _trafoCoreTemperature,
+    igbtTemperature: _igbtTemperature,
+    heatSyncTemperature: _heatSyncTemperature,
+    energy: _energy,
+    deposition: _deposition,
+    idleTimeSeconds: _idleTimeSeconds,
+    idleTime: _idleTime,
+    ...customerSession
+  } = formattedSession;
   return customerSession;
 }
 
@@ -675,7 +688,8 @@ function formatLiveWelderAssignment(assignment) {
 
   return {
     id: assignment.id,
-    status: assignment.status,
+    status,
+    assignmentStatus: assignment.status,
     trackingMode: assignment.trackingMode,
     startedAt: assignment.startedAt,
     endedAt: assignment.endedAt,
@@ -710,17 +724,13 @@ function formatLiveWelderAssignment(assignment) {
 
 function formatLiveWelderAssignmentForUser(assignment, user) {
   const formattedAssignment = formatLiveWelderAssignment(assignment);
-  if (isSuperAdmin(user)) return formattedAssignment;
+  if (hasFullAccess(user)) return formattedAssignment;
 
   const {
-    current: _current,
-    voltage: _voltage,
     inputVoltage: _inputVoltage,
     temperature: _temperature,
-    telemetryAt: _telemetryAt,
     idleTimeSeconds: _idleTimeSeconds,
     idleTime: _idleTime,
-    arcCount: _arcCount,
     ...customerAssignment
   } = formattedAssignment;
 
@@ -1764,7 +1774,7 @@ router.get("/reports/live-welder-sessions", async (req, res) => {
       prisma.welderSession.findMany({
         where: { status: "ACTIVE", endedAt: null, ...machineFilter },
         orderBy: { startedAt: "desc" },
-        include: { welder: true, machine: { include: { telemetry: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 } } } },
+        include: { welder: true, machine: { include: { latestTelemetry: true } } },
       }),
       prisma.activeWelderAssignment.findMany({
         where: { status: "ACTIVE", endedAt: null, ...machineFilter },
@@ -1832,11 +1842,128 @@ router.get("/machine/:id/production/timeline", async (req, res) => {
   }
 });
 
-router.get("/welder-arc-events.csv", async (req, res) => {
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", 'attachment; filename="welder-arc-events.csv"');
-  return res.send("Machine,Welder,Arc Start,Arc End,Duration Seconds,Average Current,Average Voltage,Quality\n");
-});
+function escapeCsvValue(value) {
+  const text = value === undefined || value === null ? "" : String(value);
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+async function getWelderArcEventsForReport(req) {
+  const machineIdentifier = parseMachineIdentifier(req.query.machineId);
+  const reportDate = req.query.date ? parseProductionDate(req.query.date) : null;
+  const from = parseOptionalDate(req.query.from);
+  const to = parseOptionalDate(req.query.to);
+  const allowedMachineIds = await getAccessibleMachineIds(req.user);
+  let machineId = null;
+
+  if (req.query.date && !reportDate) {
+    const error = new Error("date query parameter must use YYYY-MM-DD");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (machineIdentifier) {
+    const machine = await findMachineByIdentifier(machineIdentifier, { select: { id: true } });
+    if (!machine) {
+      const error = new Error(`Machine with identifier ${machineIdentifier} not found`);
+      error.statusCode = 404;
+      throw error;
+    }
+    if (!(await canAccessMachine(req.user, machine.id))) {
+      const error = new Error("Machine access denied");
+      error.statusCode = 403;
+      throw error;
+    }
+    machineId = machine.id;
+  }
+
+  const dateRange = reportDate
+    ? { gte: reportDate, lt: new Date(reportDate.getTime() + 24 * 60 * 60 * 1000) }
+    : { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) };
+
+  return prisma.welderArcEvent.findMany({
+    where: {
+      ...(machineId ? { machineId } : {}),
+      ...(allowedMachineIds === null || machineId ? {} : { machineId: { in: allowedMachineIds } }),
+      ...(Object.keys(dateRange).length ? { startTime: dateRange } : {}),
+    },
+    orderBy: [{ startTime: "desc" }, { id: "desc" }],
+    take: 1000,
+    include: { machine: true, welder: true },
+  });
+}
+
+async function sendWelderArcEventsCsv(req, res) {
+  if (!requireAuthenticated(req, res)) return;
+
+  try {
+    const events = await getWelderArcEventsForReport(req);
+    const rows = [
+      ["Machine", "Serial Number", "Welder", "Arc Start", "Arc End", "Duration Seconds", "Average Current", "Average Voltage", "Quality"],
+      ...events.map((event) => [
+        event.machine?.machineCode || event.machineId,
+        event.machine?.serialNumber || "",
+        event.welderName || event.welder?.name || "UNKNOWN",
+        event.startTime.toISOString(),
+        event.endTime?.toISOString() || "",
+        event.durationSeconds ?? Math.max(0, Math.floor((Date.now() - event.startTime.getTime()) / 1000)),
+        event.avgCurrent ?? event.startOutputCurrent ?? 0,
+        event.avgVoltage ?? event.startOutputVoltage ?? 0,
+        event.qualityStatus || (event.endTime ? "UNKNOWN" : "ACTIVE"),
+      ]),
+    ];
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="welder-arc-events.csv"');
+    return res.send(rows.map((row) => row.map(escapeCsvValue).join(",")).join("\n"));
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    return sendInternalError("Welder arc CSV report error", error, res);
+  }
+}
+
+async function sendWelderArcEventsPdf(req, res) {
+  if (!requireAuthenticated(req, res)) return;
+
+  try {
+    const events = await getWelderArcEventsForReport(req);
+    const document = new PDFDocument({ margin: 40, size: "A4" });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="welder-arc-events.pdf"');
+    document.pipe(res);
+    document.fontSize(18).text("Welder Arc Events Report");
+    document.moveDown(0.5);
+    document.fontSize(10).text(`Date: ${req.query.date || "All available dates"}`);
+    document.moveDown();
+
+    if (!events.length) {
+      document.text("No arc events found.");
+    } else {
+      for (const event of events) {
+        const durationSeconds = event.durationSeconds ??
+          Math.max(0, Math.floor((Date.now() - event.startTime.getTime()) / 1000));
+        document
+          .fontSize(10)
+          .text(
+            `${event.machine?.machineCode || event.machineId} | ` +
+            `${event.welderName || event.welder?.name || "UNKNOWN"} | ` +
+            `${event.startTime.toISOString()} | ${durationSeconds}s | ` +
+            `${event.avgCurrent ?? event.startOutputCurrent ?? 0}A | ` +
+            `${event.avgVoltage ?? event.startOutputVoltage ?? 0}V`
+          );
+        document.moveDown(0.4);
+      }
+    }
+
+    document.end();
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    return sendInternalError("Welder arc PDF report error", error, res);
+  }
+}
+
+router.get("/reports/welder-arc-events.csv", sendWelderArcEventsCsv);
+router.get("/reports/welder-arc-events.pdf", sendWelderArcEventsPdf);
+router.get("/welder-arc-events.csv", sendWelderArcEventsCsv);
 
 router.get("/welder-arc-events", async (req, res) => {
   if (!requireAuthenticated(req, res)) return;
