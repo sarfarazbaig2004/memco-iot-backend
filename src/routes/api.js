@@ -1912,8 +1912,12 @@ async function sendWelderArcEventsCsv(req, res) {
       ]),
     ];
 
+    const reportDate = req.query.date || new Date().toISOString().slice(0, 10);
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", 'attachment; filename="welder-arc-events.csv"');
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="welder-arc-report-${reportDate}.csv"`
+    );
     return res.send(rows.map((row) => row.map(escapeCsvValue).join(",")).join("\n"));
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
@@ -1927,8 +1931,12 @@ async function sendWelderArcEventsPdf(req, res) {
   try {
     const events = await getWelderArcEventsForReport(req);
     const document = new PDFDocument({ margin: 40, size: "A4" });
+    const reportDate = req.query.date || new Date().toISOString().slice(0, 10);
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", 'attachment; filename="welder-arc-events.pdf"');
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="welder-arc-report-${reportDate}.pdf"`
+    );
     document.pipe(res);
     document.fontSize(18).text("Welder Arc Events Report");
     document.moveDown(0.5);
