@@ -51,8 +51,13 @@ model Telemetry {
   machineId            Int
   timestamp            DateTime
   inputVoltage         Float?
+  inputVoltageR        Float?
+  inputVoltageY        Float?
+  inputVoltageB        Float?
   outputVoltage        Float?
   outputCurrent        Float?
+  currentSetting       Float?
+  fanPulsePerMin       Float?
   temperature          Float?
   arcOn                Boolean?
   createdAt            DateTime @default(now())
@@ -62,7 +67,12 @@ model Telemetry {
   gpsFix               Boolean?
   gpsLat               Float?
   gpsLng               Float?
+  gpsAltitude          Float?
   mapUrl               String?
+  alarms               Json?
+  warnings             Json?
+  runningJob           Json?
+  machineLifetime      Json?
   machineOn            Boolean?
   machine              Machine  @relation(fields: [machineId], references: [id])
 }
@@ -72,8 +82,13 @@ model MachineLatestTelemetry {
   machineId            Int      @unique
   timestamp            DateTime
   inputVoltage         Float?
+  inputVoltageR        Float?
+  inputVoltageY        Float?
+  inputVoltageB        Float?
   outputVoltage        Float?
   outputCurrent        Float?
+  currentSetting       Float?
+  fanPulsePerMin       Float?
   temperature          Float?
   trafoCoreTemperature Float?
   igbtTemperature      Float?
@@ -84,7 +99,12 @@ model MachineLatestTelemetry {
   gpsFix               Boolean?
   gpsLat               Float?
   gpsLng               Float?
+  gpsAltitude          Float?
   mapUrl               String?
+  alarms               Json?
+  warnings             Json?
+  runningJob           Json?
+  machineLifetime      Json?
   telemetryId          Int?
   lastReceivedAt       DateTime @default(now())
   updatedAt            DateTime @updatedAt

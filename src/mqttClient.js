@@ -92,12 +92,40 @@ function parseTimestamp(value) {
   return Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
 }
 
+function parseDeviceDateTime(value) {
+  if (!Array.isArray(value) || value.length < 6) return null;
+
+  const [hours, minutes, seconds, day, month, rawYear] = value.map(parseNumber);
+  if ([hours, minutes, seconds, day, month, rawYear].some((part) => part === null)) {
+    return null;
+  }
+
+  const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+  const timestamp = new Date(year, month - 1, day, hours, minutes, seconds);
+
+  if (
+    Number.isNaN(timestamp.getTime()) ||
+    timestamp.getFullYear() !== year ||
+    timestamp.getMonth() !== month - 1 ||
+    timestamp.getDate() !== day
+  ) {
+    return null;
+  }
+
+  // A stale device clock must not make otherwise live MQTT data look offline.
+  const maximumClockDriftMs = 24 * 60 * 60 * 1000;
+  return Math.abs(Date.now() - timestamp.getTime()) <= maximumClockDriftMs
+    ? timestamp
+    : null;
+}
+
 function parseDateTimePayload(payload) {
+  const deviceDateTime = parseDeviceDateTime(payload.time_date);
+  if (deviceDateTime) return deviceDateTime;
+
   const datePart = parseOptionalString(payload.Date);
   const timePart = parseOptionalString(payload.Time);
-  const combinedDateTime = parseOptionalString(payload.time_date);
 
-  if (combinedDateTime) return combinedDateTime;
   if (datePart && timePart) return `${datePart} ${timePart}`;
 
   return payload.timestamp;
@@ -156,7 +184,7 @@ function hasTelemetryField(payload, fields) {
 }
 
 function hasGpsPayload(payload) {
-  return hasTelemetryField(payload, ["gpsLat", "gpsLng", "lat", "lon"]);
+  return hasTelemetryField(payload, ["gpsLat", "gpsLng", "lat", "lon", "GPS"]);
 }
 
 function hasWeldingPayload(payload) {
@@ -289,7 +317,7 @@ function normalizeTelemetryPayload(payload, topic) {
       normalizedPayload.outputVoltage ?? parseNumber(readings[5]);
 
     normalizedPayload.currentSetting =
-      normalizedPayload.currentSetting ?? parseNumber(readings[7]);
+      normalizedPayload.currentSetting ?? parseNumber(readings[8]);
 
     normalizedPayload.inputVoltageR =
       normalizedPayload.inputVoltageR ?? parseNumber(readings[9]);
@@ -302,6 +330,12 @@ function normalizeTelemetryPayload(payload, topic) {
 
     normalizedPayload.fanPulsePerMin =
       normalizedPayload.fanPulsePerMin ?? parseNumber(readings[12]);
+
+    normalizedPayload.alarms =
+      normalizedPayload.alarms ?? readings[13] ?? null;
+
+    normalizedPayload.warnings =
+      normalizedPayload.warnings ?? readings[14] ?? null;
 
     normalizedPayload.inputVoltage =
       normalizedPayload.inputVoltage ??
@@ -317,7 +351,9 @@ function normalizeTelemetryPayload(payload, topic) {
         (normalizedPayload.inputVoltageR || 0) > 100 ||
         (normalizedPayload.inputVoltageY || 0) > 100 ||
         (normalizedPayload.inputVoltageB || 0) > 100 ||
-        (normalizedPayload.fanPulsePerMin || 0) > 0
+        (normalizedPayload.fanPulsePerMin || 0) > 0 ||
+        (normalizedPayload.outputCurrent || 0) > 15 ||
+        (normalizedPayload.outputVoltage || 0) > 10
       );
 
     normalizedPayload.arcOn =
@@ -331,10 +367,18 @@ function normalizeTelemetryPayload(payload, topic) {
     normalizedPayload.machineLifetime ?? parseProductionStats(normalizedPayload.mPdata);
 
   normalizedPayload.gpsLat =
-    normalizedPayload.gpsLat ?? parseNumber(normalizedPayload.lat);
+    normalizedPayload.gpsLat ??
+    parseNumber(normalizedPayload.lat) ??
+    (Array.isArray(normalizedPayload.GPS) ? parseNumber(normalizedPayload.GPS[0]) : null);
 
   normalizedPayload.gpsLng =
-    normalizedPayload.gpsLng ?? parseNumber(normalizedPayload.lon);
+    normalizedPayload.gpsLng ??
+    parseNumber(normalizedPayload.lon) ??
+    (Array.isArray(normalizedPayload.GPS) ? parseNumber(normalizedPayload.GPS[1]) : null);
+
+  normalizedPayload.gpsAltitude =
+    normalizedPayload.gpsAltitude ??
+    (Array.isArray(normalizedPayload.GPS) ? parseNumber(normalizedPayload.GPS[2]) : null);
 
   const machineIdentifier = parseMachineIdentifier(normalizedPayload, topic);
 
@@ -342,9 +386,17 @@ function normalizeTelemetryPayload(payload, topic) {
     throw new Error("machineId, machineCode, or machine topic suffix is required");
   }
 
-  const inputVoltage = parseNumber(normalizedPayload.inputVoltage);
+  const inputVoltageR = parseNumber(normalizedPayload.inputVoltageR);
+  const inputVoltageY = parseNumber(normalizedPayload.inputVoltageY);
+  const inputVoltageB = parseNumber(normalizedPayload.inputVoltageB);
+  const inputVoltage = getFirstValidNumber(
+    normalizedPayload.inputVoltage,
+    Math.max(...[inputVoltageR, inputVoltageY, inputVoltageB].filter((value) => value !== null))
+  );
   const outputVoltage = parseNumber(normalizedPayload.outputVoltage);
   const outputCurrent = parseNumber(normalizedPayload.outputCurrent);
+  const currentSetting = parseNumber(normalizedPayload.currentSetting);
+  const fanPulsePerMin = parseNumber(normalizedPayload.fanPulsePerMin);
 
   const trafoCoreTemperature = getFirstValidNumber(
     normalizedPayload.trafoCoreTemperature,
@@ -435,8 +487,13 @@ function normalizeTelemetryPayload(payload, topic) {
     machineIdentifier,
     isGpsOnly,
     inputVoltage,
+    inputVoltageR,
+    inputVoltageY,
+    inputVoltageB,
     outputVoltage,
     outputCurrent,
+    currentSetting,
+    fanPulsePerMin,
     temperature,
     trafoCoreTemperature,
     igbtTemperature,
@@ -448,7 +505,10 @@ function normalizeTelemetryPayload(payload, topic) {
     gpsFix,
     gpsLat,
     gpsLng,
+    gpsAltitude: parseNumber(normalizedPayload.gpsAltitude),
     mapUrl,
+    alarms: normalizedPayload.alarms ?? null,
+    warnings: normalizedPayload.warnings ?? null,
     timestamp: parseTimestamp(parseDateTimePayload(normalizedPayload)),
   };
 
@@ -475,8 +535,13 @@ async function persistTelemetry(telemetry) {
       machineId: machine.id,
       timestamp: telemetry.timestamp,
       inputVoltage: telemetry.inputVoltage,
+      inputVoltageR: telemetry.inputVoltageR,
+      inputVoltageY: telemetry.inputVoltageY,
+      inputVoltageB: telemetry.inputVoltageB,
       outputVoltage: telemetry.outputVoltage,
       outputCurrent: telemetry.outputCurrent,
+      currentSetting: telemetry.currentSetting,
+      fanPulsePerMin: telemetry.fanPulsePerMin,
       temperature: telemetry.temperature,
       trafoCoreTemperature: telemetry.trafoCoreTemperature,
       igbtTemperature: telemetry.igbtTemperature,
@@ -486,7 +551,12 @@ async function persistTelemetry(telemetry) {
       gpsFix: telemetry.gpsFix,
       gpsLat: telemetry.gpsLat,
       gpsLng: telemetry.gpsLng,
+      gpsAltitude: telemetry.gpsAltitude,
       mapUrl: telemetry.mapUrl,
+      ...(telemetry.alarms !== null ? { alarms: telemetry.alarms } : {}),
+      ...(telemetry.warnings !== null ? { warnings: telemetry.warnings } : {}),
+      ...(telemetry.runningJob !== null ? { runningJob: telemetry.runningJob } : {}),
+      ...(telemetry.machineLifetime !== null ? { machineLifetime: telemetry.machineLifetime } : {}),
     },
   });
 

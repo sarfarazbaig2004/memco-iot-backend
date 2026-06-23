@@ -125,7 +125,7 @@ async function incrementDailySummary(tx, machineId, date, data) {
       lastUpdatedAt: data.lastUpdatedAt || new Date(),
     },
     update: data,
-  });
+  }, { timeout: 15000, maxWait: 10000 });
 }
 
 async function addDurationToDailySummaries(tx, machineId, state, startTime, endTime) {
@@ -205,8 +205,13 @@ function buildLatestTelemetryData(telemetry, state) {
     machineId: telemetry.machineId,
     timestamp: telemetry.timestamp,
     inputVoltage: telemetry.inputVoltage,
+    inputVoltageR: telemetry.inputVoltageR,
+    inputVoltageY: telemetry.inputVoltageY,
+    inputVoltageB: telemetry.inputVoltageB,
     outputVoltage: telemetry.outputVoltage,
     outputCurrent: telemetry.outputCurrent,
+    currentSetting: telemetry.currentSetting,
+    fanPulsePerMin: telemetry.fanPulsePerMin,
     temperature: telemetry.temperature,
     trafoCoreTemperature: telemetry.trafoCoreTemperature,
     igbtTemperature: telemetry.igbtTemperature,
@@ -217,7 +222,12 @@ function buildLatestTelemetryData(telemetry, state) {
     gpsFix: telemetry.gpsFix,
     gpsLat: telemetry.gpsLat,
     gpsLng: telemetry.gpsLng,
+    gpsAltitude: telemetry.gpsAltitude,
     mapUrl: telemetry.mapUrl,
+    ...(telemetry.alarms !== null ? { alarms: telemetry.alarms } : {}),
+    ...(telemetry.warnings !== null ? { warnings: telemetry.warnings } : {}),
+    ...(telemetry.runningJob !== null ? { runningJob: telemetry.runningJob } : {}),
+    ...(telemetry.machineLifetime !== null ? { machineLifetime: telemetry.machineLifetime } : {}),
     telemetryId: telemetry.id,
     lastReceivedAt: new Date(),
   };

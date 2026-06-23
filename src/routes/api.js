@@ -503,6 +503,7 @@ function getTelemetryGps(telemetry) {
     gpsFix: telemetry?.gpsFix ?? null,
     gpsLat: telemetry?.gpsLat ?? null,
     gpsLng: telemetry?.gpsLng ?? null,
+    gpsAltitude: telemetry?.gpsAltitude ?? null,
     mapUrl: telemetry?.mapUrl ?? null,
   };
 }
@@ -656,6 +657,76 @@ function formatWelderSessionsForUser(sessions, user) {
   return sessions.map((session) => formatWelderSessionForUser(session, user));
 }
 
+function formatLiveWelderAssignment(assignment) {
+  const latestTelemetry = assignment.machine?.latestTelemetry || null;
+  const status = getMachineStatus(latestTelemetry);
+  const isWelding = status === "WELDING";
+  const now = new Date();
+  const completedArcSeconds = assignment.arcEvents.reduce(
+    (total, event) => total + (event.durationSeconds || 0),
+    0
+  );
+  const openArcSeconds = assignment.arcEvents.reduce(
+    (total, event) => total + (!event.endTime ? Math.max(0, Math.floor((now - event.startTime) / 1000)) : 0),
+    0
+  );
+  const arcingTimeSeconds = completedArcSeconds + openArcSeconds;
+  const elapsedSeconds = Math.max(0, Math.floor((now - assignment.startedAt) / 1000));
+
+  return {
+    id: assignment.id,
+    status: assignment.status,
+    trackingMode: assignment.trackingMode,
+    startedAt: assignment.startedAt,
+    endedAt: assignment.endedAt,
+    lastTelemetryAt: getTelemetryTime(latestTelemetry),
+    arcingTimeSeconds,
+    idleTimeSeconds: Math.max(0, elapsedSeconds - arcingTimeSeconds),
+    arcingTime: formatDurationSeconds(arcingTimeSeconds),
+    idleTime: formatDurationSeconds(Math.max(0, elapsedSeconds - arcingTimeSeconds)),
+    arcCount: assignment.arcEvents.length,
+    current: isWelding ? latestTelemetry?.outputCurrent || 0 : 0,
+    voltage: isWelding ? latestTelemetry?.outputVoltage || 0 : 0,
+    inputVoltage: status === "OFFLINE" ? 0 : latestTelemetry?.inputVoltage || 0,
+    temperature: status === "OFFLINE" ? null : deriveTelemetryTemperature(latestTelemetry),
+    telemetryAt: getTelemetryTime(latestTelemetry),
+    welder: {
+      id: assignment.welder?.id || null,
+      name: assignment.welderName || assignment.welder?.name || "UNKNOWN",
+      employeeCode: assignment.employeeCode || assignment.welder?.employeeCode || null,
+      rfidCardNo: assignment.rfidCardNo || assignment.welder?.rfidCardNo || null,
+      active: assignment.welder?.active ?? true,
+    },
+    machine: assignment.machine
+      ? {
+          id: assignment.machine.id,
+          machineCode: assignment.machine.machineCode,
+          serialNumber: assignment.machine.serialNumber || "",
+          location: assignment.machine.location || "Shop Floor",
+        }
+      : null,
+  };
+}
+
+function formatLiveWelderAssignmentForUser(assignment, user) {
+  const formattedAssignment = formatLiveWelderAssignment(assignment);
+  if (isSuperAdmin(user)) return formattedAssignment;
+
+  const {
+    current: _current,
+    voltage: _voltage,
+    inputVoltage: _inputVoltage,
+    temperature: _temperature,
+    telemetryAt: _telemetryAt,
+    idleTimeSeconds: _idleTimeSeconds,
+    idleTime: _idleTime,
+    arcCount: _arcCount,
+    ...customerAssignment
+  } = formattedAssignment;
+
+  return customerAssignment;
+}
+
 function formatWelderAssignment(assignment) {
   if (!assignment) return null;
   return {
@@ -709,6 +780,14 @@ async function findActiveWelderSession(machineId) {
       welder: true,
       machine: { include: { telemetry: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 } } },
     },
+  });
+}
+
+async function findActiveWelderAssignment(machineId) {
+  return prisma.activeWelderAssignment.findFirst({
+    where: { machineId, status: "ACTIVE", endedAt: null },
+    orderBy: [{ startedAt: "desc" }, { id: "desc" }],
+    include: { welder: true },
   });
 }
 
@@ -1321,19 +1400,29 @@ router.post("/telemetry", async (req, res) => {
   const requestStartedAt = Date.now();
   try {
     const {
-      machineId, timestamp, inputVoltage, outputVoltage, outputCurrent,
+      machineId, timestamp, inputVoltage, inputVoltageR, inputVoltageY, inputVoltageB,
+      outputVoltage, outputCurrent, currentSetting, fanPulsePerMin,
       temperature, trafoCoreTemperature, transformerCoreTemperature,
       igbtTemperature, heatSyncTemperature, heatSinkTemperature,
-      machineOn, arcOn, gpsFix, gpsLat, gpsLng, mapUrl,
+      machineOn, arcOn, gpsFix, gpsLat, gpsLng, gpsAltitude, mapUrl,
+      alarms, warnings, runningJob, machineLifetime,
     } = req.body;
 
     const machineIdentifier = parseMachineIdentifier(machineId);
     if (!machineIdentifier) return res.status(400).json({ error: "machineId is required" });
 
     const parsedTimestamp = parseTimestamp(timestamp);
-    const parsedInputVoltage = parseOptionalNumber(inputVoltage);
+    const parsedInputVoltageR = parseOptionalNumber(inputVoltageR);
+    const parsedInputVoltageY = parseOptionalNumber(inputVoltageY);
+    const parsedInputVoltageB = parseOptionalNumber(inputVoltageB);
+    const parsedInputVoltage = firstPresentNumber(
+      parseOptionalNumber(inputVoltage),
+      Math.max(...[parsedInputVoltageR, parsedInputVoltageY, parsedInputVoltageB].filter((value) => value !== null && !Number.isNaN(value)))
+    );
     const parsedOutputVoltage = parseOptionalNumber(outputVoltage);
     const parsedOutputCurrent = parseOptionalNumber(outputCurrent);
+    const parsedCurrentSetting = parseOptionalNumber(currentSetting);
+    const parsedFanPulsePerMin = parseOptionalNumber(fanPulsePerMin);
     const parsedTrafoCoreTemperature = firstPresentNumber(parseOptionalNumber(trafoCoreTemperature), parseOptionalNumber(transformerCoreTemperature));
     const parsedIgbtTemperature = parseOptionalNumber(igbtTemperature);
     const parsedHeatSyncTemperature = firstPresentNumber(parseOptionalNumber(heatSyncTemperature), parseOptionalNumber(heatSinkTemperature));
@@ -1341,6 +1430,7 @@ router.post("/telemetry", async (req, res) => {
     const rawGpsFix = parseOptionalBoolean(gpsFix);
     const parsedGpsLat = parseOptionalNumber(gpsLat);
     const parsedGpsLng = parseOptionalNumber(gpsLng);
+    const parsedGpsAltitude = parseOptionalNumber(gpsAltitude);
     const parsedMapUrl = buildMapUrl(parsedGpsLat, parsedGpsLng, parseOptionalString(mapUrl));
     const parsedGpsFix = rawGpsFix ?? (parsedGpsLat !== null && parsedGpsLng !== null ? true : null);
     const parsedTemperature = firstPresentNumber(parseOptionalNumber(temperature), Math.max(...[parsedTrafoCoreTemperature, parsedIgbtTemperature, parsedHeatSyncTemperature].filter((value) => value !== null && !Number.isNaN(value))));
@@ -1348,7 +1438,7 @@ router.post("/telemetry", async (req, res) => {
 
     if (!parsedTimestamp) return res.status(400).json({ error: "Invalid timestamp format" });
 
-    if (Number.isNaN(parsedInputVoltage) || Number.isNaN(parsedOutputVoltage) || Number.isNaN(parsedOutputCurrent) || Number.isNaN(parsedTemperature) || Number.isNaN(parsedTrafoCoreTemperature) || Number.isNaN(parsedIgbtTemperature) || Number.isNaN(parsedHeatSyncTemperature) || Number.isNaN(parsedGpsLat) || Number.isNaN(parsedGpsLng)) {
+    if (Number.isNaN(parsedInputVoltage) || Number.isNaN(parsedInputVoltageR) || Number.isNaN(parsedInputVoltageY) || Number.isNaN(parsedInputVoltageB) || Number.isNaN(parsedOutputVoltage) || Number.isNaN(parsedOutputCurrent) || Number.isNaN(parsedCurrentSetting) || Number.isNaN(parsedFanPulsePerMin) || Number.isNaN(parsedTemperature) || Number.isNaN(parsedTrafoCoreTemperature) || Number.isNaN(parsedIgbtTemperature) || Number.isNaN(parsedHeatSyncTemperature) || Number.isNaN(parsedGpsLat) || Number.isNaN(parsedGpsLng) || Number.isNaN(parsedGpsAltitude)) {
       return res.status(400).json({ error: "Voltage, current, temperature, and GPS coordinate values must be valid numbers" });
     }
 
@@ -1360,7 +1450,18 @@ router.post("/telemetry", async (req, res) => {
     if (!machine) return res.status(404).json({ error: `Machine with identifier ${machineIdentifier} not found` });
 
     const telemetry = await prisma.telemetry.create({
-      data: { machineId: machine.id, timestamp: parsedTimestamp, inputVoltage: parsedInputVoltage, outputVoltage: parsedOutputVoltage, outputCurrent: parsedOutputCurrent, temperature: parsedTemperature, trafoCoreTemperature: parsedTrafoCoreTemperature, igbtTemperature: parsedIgbtTemperature, heatSyncTemperature: parsedHeatSyncTemperature, machineOn: parsedMachineOn, arcOn: parsedArcOn, gpsFix: parsedGpsFix, gpsLat: parsedGpsLat, gpsLng: parsedGpsLng, mapUrl: parsedMapUrl },
+      data: {
+        machineId: machine.id, timestamp: parsedTimestamp,
+        inputVoltage: parsedInputVoltage, inputVoltageR: parsedInputVoltageR, inputVoltageY: parsedInputVoltageY, inputVoltageB: parsedInputVoltageB,
+        outputVoltage: parsedOutputVoltage, outputCurrent: parsedOutputCurrent, currentSetting: parsedCurrentSetting, fanPulsePerMin: parsedFanPulsePerMin,
+        temperature: parsedTemperature, trafoCoreTemperature: parsedTrafoCoreTemperature, igbtTemperature: parsedIgbtTemperature, heatSyncTemperature: parsedHeatSyncTemperature,
+        machineOn: parsedMachineOn, arcOn: parsedArcOn,
+        gpsFix: parsedGpsFix, gpsLat: parsedGpsLat, gpsLng: parsedGpsLng, gpsAltitude: parsedGpsAltitude, mapUrl: parsedMapUrl,
+        ...(alarms !== undefined && alarms !== null ? { alarms } : {}),
+        ...(warnings !== undefined && warnings !== null ? { warnings } : {}),
+        ...(runningJob !== undefined && runningJob !== null ? { runningJob } : {}),
+        ...(machineLifetime !== undefined && machineLifetime !== null ? { machineLifetime } : {}),
+      },
     });
 
     await updateActiveWelderSessionFromTelemetry(telemetry);
@@ -1392,17 +1493,23 @@ router.get("/machine/:id/overview", async (req, res) => {
     if (isCustomerForbiddenForMachine(accessUser, machine.id)) return sendForbiddenMachineAccess(res);
     if (!(await canAccessMachine(req.user, machine.id))) return res.status(403).json({ error: "Machine access denied" });
 
-    const [telemetry, historyRaw, activeSession] = await Promise.all([
-      prisma.telemetry.findFirst({ where: { machineId: machine.id }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }),
-      prisma.telemetry.findMany({ where: { machineId: machine.id }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 20 }),
+    const [telemetry, historyRaw, activeSession, activeAssignment] = await Promise.all([
+      prisma.machineLatestTelemetry.findUnique({ where: { machineId: machine.id } }),
+      prisma.telemetry.findMany({ where: { machineId: machine.id }, orderBy: [{ timestamp: "desc" }, { id: "desc" }], take: 20 }),
       findActiveWelderSession(machine.id),
+      findActiveWelderAssignment(machine.id),
     ]);
+    const activeWelder = activeSession?.welder
+      ? { id: activeSession.welder.id, name: activeSession.welder.name, employeeCode: activeSession.welder.employeeCode, rfidCardNo: activeSession.welder.rfidCardNo }
+      : activeAssignment
+        ? { id: activeAssignment.welder?.id || null, name: activeAssignment.welderName || activeAssignment.welder?.name || "Unknown", employeeCode: activeAssignment.employeeCode || activeAssignment.welder?.employeeCode || null, rfidCardNo: activeAssignment.rfidCardNo || activeAssignment.welder?.rfidCardNo || null }
+        : null;
 
     if (!telemetry) {
       return res.json({
         ...buildEmptyOverview(machine),
         activeWelderSession: formatWelderSession(activeSession),
-        activeWelder: activeSession?.welder ? { id: activeSession.welder.id, name: activeSession.welder.name, employeeCode: activeSession.welder.employeeCode, rfidCardNo: activeSession.welder.rfidCardNo } : null,
+        activeWelder,
       });
     }
 
@@ -1410,11 +1517,19 @@ router.get("/machine/:id/overview", async (req, res) => {
     const secondsSinceLastTelemetry = getSecondsSinceLastTelemetry(telemetry);
     const lastUpdatedAt = getTelemetryTime(telemetry);
     const isFresh = status !== "OFFLINE" && telemetry.machineOn;
+    const isWelding = status === "WELDING";
     const controls = getMachineControls(machine.id);
     const { health, alarms, warnings } = isFresh ? buildHealthState(telemetry) : buildHealthState(null);
 
     const trend = isFresh
-      ? historyRaw.slice().reverse().map((item) => ({ time: item.timestamp || item.createdAt, current: Math.min(Math.max(item.outputCurrent || 0, 0), 400), voltage: Math.min(Math.max(item.outputVoltage || 0, 0), 100) }))
+      ? historyRaw.slice().reverse().map((item) => {
+          const sampleIsWelding = item.arcOn === true || Number(item.outputCurrent) > 20;
+          return {
+            time: item.timestamp || item.createdAt,
+            current: sampleIsWelding ? Math.min(Math.max(item.outputCurrent || 0, 0), 400) : 0,
+            voltage: sampleIsWelding ? Math.min(Math.max(item.outputVoltage || 0, 0), 100) : 0,
+          };
+        })
       : [];
 
     const overviewTemperature = isFresh ? deriveTelemetryTemperature(telemetry) : null;
@@ -1425,18 +1540,30 @@ router.get("/machine/:id/overview", async (req, res) => {
       machineId: machine.id, machineCode: machine.machineCode, serialNumber: machine.serialNumber || "", location: machine.location || "Shop Floor",
       status, health, healthLabel: getHealthLabel(health), alarmCount: alarms.length, warningCount: warnings.length,
       lastUpdatedAt, secondsSinceLastTelemetry,
-      outputCurrent: isFresh ? Math.min(Math.max(telemetry.outputCurrent || 0, 0), 400) : 0,
+      outputCurrent: isWelding ? Math.min(Math.max(telemetry.outputCurrent || 0, 0), 400) : 0,
       temperature: overviewTemperature, trafoCoreTemperature: temperatures.trafoCore, igbtTemperature: temperatures.igbt, heatSyncTemperature: temperatures.heatSync,
       ...gps,
-      weldingCurrent: isFresh ? Math.min(Math.max(telemetry.outputCurrent || 0, 0), 400) : 0,
-      weldingVoltage: isFresh ? Math.min(Math.max(telemetry.outputVoltage || 0, 0), 100) : 0,
-      currentSetting: controls.currentSetting, fanSpeed: 0,
-      inputVoltage: { R: isFresh ? Math.min(Math.max(telemetry.inputVoltage || 0, 0), 500) : 0, Y: isFresh ? Math.min(Math.max(telemetry.inputVoltage || 0, 0), 500) : 0, B: isFresh ? Math.min(Math.max(telemetry.inputVoltage || 0, 0), 500) : 0 },
+      weldingCurrent: isWelding ? Math.min(Math.max(telemetry.outputCurrent || 0, 0), 400) : 0,
+      weldingVoltage: isWelding ? Math.min(Math.max(telemetry.outputVoltage || 0, 0), 100) : 0,
+      currentSetting: telemetry.currentSetting ?? controls.currentSetting,
+      fanSpeed: telemetry.fanPulsePerMin ?? 0,
+      inputVoltage: {
+        R: isFresh ? Math.min(Math.max(telemetry.inputVoltageR ?? telemetry.inputVoltage ?? 0, 0), 500) : 0,
+        Y: isFresh ? Math.min(Math.max(telemetry.inputVoltageY ?? telemetry.inputVoltage ?? 0, 0), 500) : 0,
+        B: isFresh ? Math.min(Math.max(telemetry.inputVoltageB ?? telemetry.inputVoltage ?? 0, 0), 500) : 0,
+      },
+      inputLineVoltage: {
+        RY: isFresh ? Math.min(Math.max(telemetry.inputVoltageR ?? 0, 0), 500) : 0,
+        YB: isFresh ? Math.min(Math.max(telemetry.inputVoltageY ?? 0, 0), 500) : 0,
+        BR: isFresh ? Math.min(Math.max(telemetry.inputVoltageB ?? 0, 0), 500) : 0,
+      },
+      deviceAlarms: telemetry.alarms ?? null,
+      deviceWarnings: telemetry.warnings ?? null,
       temperatures, alarms, warnings, trend,
       runningJob: telemetry.runningJob || { arcTime: "0:0:0", idleTime: "0:0:0", dcEnergy: 0, deposition: 0, wireFeedMeter: 0, arcCount: 0 },
       lifetime: telemetry.machineLifetime || { arcTime: "0:0:0", idleTime: "0:0:0", dcEnergy: 0, deposition: 0, wireFeedMeter: 0, arcCount: 0 },
       activeWelderSession: formatWelderSession(activeSession),
-      activeWelder: activeSession?.welder ? { id: activeSession.welder.id, name: activeSession.welder.name, employeeCode: activeSession.welder.employeeCode, rfidCardNo: activeSession.welder.rfidCardNo } : null,
+      activeWelder,
     });
   } catch (error) {
     return sendInternalError("Machine overview error", error, res);
@@ -1451,31 +1578,42 @@ router.get("/machines/overview", async (req, res) => {
       orderBy: { id: "asc" },
       select: {
         id: true, machineCode: true, serialNumber: true, location: true,
-        telemetry: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1, select: { arcOn: true, timestamp: true, createdAt: true, inputVoltage: true, outputVoltage: true, outputCurrent: true, temperature: true, trafoCoreTemperature: true, igbtTemperature: true, heatSyncTemperature: true, machineOn: true, gpsFix: true, gpsLat: true, gpsLng: true, mapUrl: true } },
+        latestTelemetry: { select: { arcOn: true, timestamp: true, inputVoltage: true, outputVoltage: true, outputCurrent: true, temperature: true, trafoCoreTemperature: true, igbtTemperature: true, heatSyncTemperature: true, machineOn: true, gpsFix: true, gpsLat: true, gpsLng: true, gpsAltitude: true, mapUrl: true } },
         welderSessions: { where: { status: "ACTIVE", endedAt: null }, orderBy: { startedAt: "desc" }, take: 1, include: { welder: true, machine: { include: { telemetry: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 } } } } },
+        activeWelderAssignments: { where: { status: "ACTIVE", endedAt: null }, orderBy: [{ startedAt: "desc" }, { id: "desc" }], take: 1, include: { welder: true } },
       },
     });
 
     const result = machines.map((machine) => {
-      const latest = machine.telemetry[0] || null;
+      const latest = machine.latestTelemetry || null;
       const activeSession = machine.welderSessions[0] || null;
+      const activeAssignment = machine.activeWelderAssignments[0] || null;
+      const welderName = activeSession?.welder?.name || activeAssignment?.welderName || activeAssignment?.welder?.name || "Unknown";
       const status = getMachineStatus(latest);
+      const hasLiveReadings = status === "IDLE" || status === "WELDING";
+      const isWelding = status === "WELDING";
       const temperature = deriveTelemetryTemperature(latest);
       const gps = getTelemetryGps(latest);
 
       if (status === "OFFLINE") {
-        return { ...buildOfflineFleetMachine(machine, latest), welder: activeSession?.welder?.name || "Unknown", activeWelderSession: formatWelderSession(activeSession) };
+        return { ...buildOfflineFleetMachine(machine, latest), welder: welderName, activeWelderSession: formatWelderSession(activeSession) };
       }
 
-      const { health, alarms, warnings } = buildHealthState(latest);
+      const { health, alarms, warnings } = hasLiveReadings
+        ? buildHealthState(latest)
+        : buildHealthState(null);
       return {
         id: machine.id, machineId: machine.id, code: machine.machineCode, machineCode: machine.machineCode, serialNumber: machine.serialNumber || "", location: machine.location || "Shop Floor",
         status, health, healthLabel: getHealthLabel(health), isLive: true,
         lastSeen: getTelemetryTime(latest), lastUpdatedAt: getTelemetryTime(latest), secondsSinceLastTelemetry: getSecondsSinceLastTelemetry(latest),
-        current: latest?.outputCurrent || 0, outputCurrent: latest?.outputCurrent || 0, voltage: latest?.outputVoltage || 0, outputVoltage: latest?.outputVoltage || 0,
-        temperature, trafoCoreTemperature: latest?.trafoCoreTemperature ?? temperature, igbtTemperature: latest?.igbtTemperature ?? temperature, heatSyncTemperature: latest?.heatSyncTemperature ?? temperature,
+        current: isWelding ? latest?.outputCurrent || 0 : 0, outputCurrent: isWelding ? latest?.outputCurrent || 0 : 0,
+        voltage: isWelding ? latest?.outputVoltage || 0 : 0, outputVoltage: isWelding ? latest?.outputVoltage || 0 : 0,
+        temperature: hasLiveReadings ? temperature : null,
+        trafoCoreTemperature: hasLiveReadings ? latest?.trafoCoreTemperature ?? temperature : null,
+        igbtTemperature: hasLiveReadings ? latest?.igbtTemperature ?? temperature : null,
+        heatSyncTemperature: hasLiveReadings ? latest?.heatSyncTemperature ?? temperature : null,
         ...gps, warningCount: warnings.length, alarmCount: alarms.length, warnings, alarms,
-        welder: activeSession?.welder?.name || "Unknown", activeWelderSession: formatWelderSession(activeSession),
+        welder: welderName, activeWelderSession: formatWelderSession(activeSession),
       };
     }).sort((a, b) => Number(b.isLive) - Number(a.isLive) || a.machineCode.localeCompare(b.machineCode));
 
@@ -1621,12 +1759,30 @@ router.post("/machine/:id/engineering/read-all", async (req, res) => {
 router.get("/reports/live-welder-sessions", async (req, res) => {
   try {
     const allowedMachineIds = await getAccessibleMachineIds(req.user);
-    const sessions = await prisma.welderSession.findMany({
-      where: { status: "ACTIVE", endedAt: null, ...(allowedMachineIds === null ? {} : { machineId: { in: allowedMachineIds } }) },
-      orderBy: { startedAt: "desc" },
-      include: { welder: true, machine: { include: { telemetry: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 } } } },
-    });
-    return res.json(formatWelderSessionsForUser(sessions, req.user));
+    const machineFilter = allowedMachineIds === null ? {} : { machineId: { in: allowedMachineIds } };
+    const [sessions, assignments] = await Promise.all([
+      prisma.welderSession.findMany({
+        where: { status: "ACTIVE", endedAt: null, ...machineFilter },
+        orderBy: { startedAt: "desc" },
+        include: { welder: true, machine: { include: { telemetry: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 } } } },
+      }),
+      prisma.activeWelderAssignment.findMany({
+        where: { status: "ACTIVE", endedAt: null, ...machineFilter },
+        orderBy: { startedAt: "desc" },
+        include: {
+          welder: true,
+          machine: { include: { latestTelemetry: true } },
+          arcEvents: { select: { startTime: true, endTime: true, durationSeconds: true } },
+        },
+      }),
+    ]);
+    const liveAssignments = assignments.map((assignment) =>
+      formatLiveWelderAssignmentForUser(assignment, req.user)
+    );
+    return res.json([
+      ...formatWelderSessionsForUser(sessions, req.user),
+      ...liveAssignments,
+    ].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt)));
   } catch (error) {
     return sendInternalError("Live welder session report error", error, res);
   }
