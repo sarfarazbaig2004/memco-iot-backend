@@ -141,11 +141,11 @@ function getPayloadKeys(payload) {
 // ============================================================================
 
 function isSuperAdmin(user) {
-  return user?.role === "SUPER_ADMIN" || user?.role === "SOFTWARE_SUPER_ADMIN";
+  return ["SUPER_ADMIN", "SOFTWARE_SUPER_ADMIN", "COMPANY_SUPER_ADMIN"].includes(user?.role);
 }
 
 function hasFullAccess(user) {
-  return isSuperAdmin(user) || user?.role === "COMPANY_SUPER_ADMIN";
+  return isSuperAdmin(user);
 }
 
 function requireAuthenticated(req, res) {
@@ -213,11 +213,39 @@ async function getUserModuleKeys(userId) {
 
 async function getAccessibleMachineIds(user) {
   if (!user?.id || hasFullAccess(user)) return null;
-  const rows = await prisma.userMachineAccess.findMany({
-    where: { userId: Number(user.id) },
-    select: { machineId: true },
-  });
-  return rows.map((row) => row.machineId);
+
+  const [userMachineAccessRows, customerAccessRows, customerMachineAccessRows] = await Promise.all([
+    prisma.userMachineAccess.findMany({
+      where: { userId: Number(user.id) },
+      select: { machineId: true },
+    }),
+    user.role === "CUSTOMER"
+      ? getCustomerAccessByEmail(user.email)
+      : Promise.resolve(null),
+    user.role === "CUSTOMER"
+      ? prisma.customer
+          .findFirst({
+            where: { userId: Number(user.id) },
+            select: { id: true },
+          })
+          .then((customer) =>
+            customer
+              ? prisma.customerMachineAccess.findMany({
+                  where: { customerId: customer.id },
+                  select: { machineId: true },
+                })
+              : []
+          )
+      : Promise.resolve([]),
+  ]);
+
+  const accessibleMachineIds = new Set([
+    ...userMachineAccessRows.map((row) => row.machineId),
+    ...(customerAccessRows?.machineIds || []),
+    ...(customerMachineAccessRows || []).map((row) => row.machineId),
+  ]);
+
+  return [...accessibleMachineIds];
 }
 
 async function buildMachineAccessWhere(user, baseWhere = {}) {
@@ -872,14 +900,77 @@ function buildZeroTelemetryData(machineId) {
   };
 }
 
+function buildZeroProductionStats() {
+  return {
+    arcTime: "0:0:0",
+    idleTime: "0:0:0",
+    dcEnergy: 0,
+    deposition: 0,
+    wireFeedMeter: 0,
+    arcCount: 0,
+  };
+}
+
 async function resetMachineTelemetry(machine, options = {}) {
-  if (options.clearHistory) {
-    await prisma.telemetry.deleteMany({ where: { machineId: machine.id } });
-    resetMachineControls(machine.id);
-    return { ...buildZeroTelemetryData(machine.id), id: null, createdAt: null };
-  }
+  const now = new Date();
+  const zeroProductionStats = buildZeroProductionStats();
+  const zeroTelemetry = {
+    ...buildZeroTelemetryData(machine.id),
+    timestamp: now,
+    currentSetting: DEFAULT_CURRENT_SETTING,
+    runningJob: zeroProductionStats,
+    ...(options.clearHistory ? { machineLifetime: zeroProductionStats } : {}),
+  };
+
   resetMachineControls(machine.id);
-  return prisma.telemetry.create({ data: buildZeroTelemetryData(machine.id) });
+
+  if (options.clearHistory) {
+    return prisma.$transaction(async (tx) => {
+      await tx.telemetry.deleteMany({ where: { machineId: machine.id } });
+      await tx.machineProductionEvent.deleteMany({ where: { machineId: machine.id } });
+      await tx.dailyProductionSummary.deleteMany({ where: { machineId: machine.id } });
+
+      return tx.machineLatestTelemetry.upsert({
+        where: { machineId: machine.id },
+        create: {
+          ...zeroTelemetry,
+          state: "OFF",
+          telemetryId: null,
+          lastReceivedAt: now,
+        },
+        update: {
+          ...zeroTelemetry,
+          state: "OFF",
+          telemetryId: null,
+          lastReceivedAt: now,
+        },
+      });
+    });
+  }
+
+  const latest = await prisma.machineLatestTelemetry.findUnique({
+    where: { machineId: machine.id },
+  });
+
+  if (latest) {
+    return prisma.machineLatestTelemetry.update({
+      where: { machineId: machine.id },
+      data: {
+        runningJob: zeroProductionStats,
+        currentSetting: DEFAULT_CURRENT_SETTING,
+      },
+    });
+  }
+
+  return prisma.machineLatestTelemetry.create({
+    data: {
+      ...zeroTelemetry,
+      state: "OFF",
+      machineLifetime: zeroProductionStats,
+      telemetryId: null,
+      lastReceivedAt: now,
+    },
+  });
 }
 
 // ----------------------------------------------------------------------------
@@ -1144,9 +1235,15 @@ router.put("/admin/customers/:id/access", async (req, res) => {
       return tx.user.findUnique({ where: { id: userId }, include: { moduleAccesses: true, machineAccesses: true } });
     }, { timeout: 20000 });
 
+    // Build a full access payload (includes customer-level saved access)
+    const accessPayload = await buildUserAccessPayload(updatedCustomer);
+    accessPayload.features = features;
+    accessPayload.parameters = parameters;
+    accessPayload.allMachines = allMachines === true;
+
     return res.json({
       id: updatedCustomer.id, name: updatedCustomer.name, email: updatedCustomer.email, role: updatedCustomer.role, active: updatedCustomer.active,
-      access: { ...buildUserAccessSummary(updatedCustomer, await prisma.machine.count()), features, parameters, allMachines },
+      access: accessPayload,
     });
   } catch (error) {
     return sendPrismaWriteError("Update admin customer access error", error, res);
