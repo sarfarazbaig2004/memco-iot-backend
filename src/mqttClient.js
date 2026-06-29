@@ -42,6 +42,18 @@ function truncateForLog(value, maxLength = 500) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
+async function measureMqttOperation(operation, query) {
+  const startedAt = Date.now();
+
+  try {
+    return await query();
+  } finally {
+    const elapsedMs = Date.now() - startedAt;
+    const log = elapsedMs >= 250 ? console.warn : console.log;
+    log("[mqtt] persistence operation completed", { operation, elapsedMs });
+  }
+}
+
 function parseNumber(value) {
   if (value === undefined || value === null || value === "") return null;
   const parsedValue = Number(value);
@@ -126,6 +138,13 @@ function parseMachineIdentifier(payload, topic) {
     return "WM-001";
   }
 
+  const topicPrefix = "machine/data/";
+
+  if (typeof topic === "string" && topic.startsWith(topicPrefix)) {
+    const identifier = topic.slice(topicPrefix.length).trim();
+    if (identifier && !identifier.includes("/")) return identifier;
+  }
+
   if (
     payload?.machineCode !== undefined &&
     payload?.machineCode !== null &&
@@ -136,13 +155,6 @@ function parseMachineIdentifier(payload, topic) {
 
   if (payload?.machineId !== undefined && payload?.machineId !== null) {
     return String(payload.machineId).trim();
-  }
-
-  const topicPrefix = "machine/data/";
-
-  if (typeof topic === "string" && topic.startsWith(topicPrefix)) {
-    const identifier = topic.slice(topicPrefix.length).trim();
-    if (identifier && !identifier.includes("/")) return identifier;
   }
 
   return null;
@@ -313,8 +325,6 @@ function normalizeTelemetryPayload(payload, topic) {
   if (Array.isArray(normalizedPayload.readings)) {
     const readings = normalizedPayload.readings;
 
-    normalizedPayload.machineCode = normalizedPayload.machineCode || "WM-001";
-
     normalizedPayload.trafoCoreTemperature =
       normalizedPayload.trafoCoreTemperature ?? parseNumber(readings[0]);
 
@@ -387,6 +397,15 @@ function normalizeTelemetryPayload(payload, topic) {
     normalizedPayload.gpsLng ?? parseNumber(normalizedPayload.lon);
 
   const machineIdentifier = parseMachineIdentifier(normalizedPayload, topic);
+  const payloadIdentifier = parseMachineIdentifier(normalizedPayload, null);
+
+  if (payloadIdentifier && payloadIdentifier !== machineIdentifier) {
+    console.warn("[mqtt] payload identifier differs from authoritative topic", {
+      topic,
+      topicIdentifier: machineIdentifier,
+      payloadIdentifier,
+    });
+  }
 
   if (!machineIdentifier) {
     throw new Error("machineId, machineCode, or machine topic suffix is required");
@@ -513,7 +532,9 @@ async function persistTelemetry(telemetry) {
 
   console.log("[mqtt] telemetry persistence started", summarizeTelemetry(telemetry));
 
-  const machine = await findMachineByIdentifier(telemetry.machineIdentifier);
+  const machine = await measureMqttOperation("machine.findByIdentifier", () =>
+    findMachineByIdentifier(telemetry.machineIdentifier)
+  );
 
   if (!machine) {
     throw new Error(`Machine not found for identifier ${telemetry.machineIdentifier}`);
@@ -521,25 +542,27 @@ async function persistTelemetry(telemetry) {
 
   console.log(`[mqtt] machine resolved ${telemetry.machineIdentifier} -> id ${machine.id}`);
 
-  const savedTelemetry = await prisma.telemetry.create({
-    data: {
-      machineId: machine.id,
-      timestamp: telemetry.timestamp,
-      inputVoltage: telemetry.inputVoltage,
-      outputVoltage: telemetry.outputVoltage,
-      outputCurrent: telemetry.outputCurrent,
-      temperature: telemetry.temperature,
-      trafoCoreTemperature: telemetry.trafoCoreTemperature,
-      igbtTemperature: telemetry.igbtTemperature,
-      heatSyncTemperature: telemetry.heatSyncTemperature,
-      machineOn: telemetry.machineOn,
-      arcOn: telemetry.arcOn,
-      gpsFix: telemetry.gpsFix,
-      gpsLat: telemetry.gpsLat,
-      gpsLng: telemetry.gpsLng,
-      mapUrl: telemetry.mapUrl,
-    },
-  });
+  const savedTelemetry = await measureMqttOperation("telemetry.create", () =>
+    prisma.telemetry.create({
+      data: {
+        machineId: machine.id,
+        timestamp: telemetry.timestamp,
+        inputVoltage: telemetry.inputVoltage,
+        outputVoltage: telemetry.outputVoltage,
+        outputCurrent: telemetry.outputCurrent,
+        temperature: telemetry.temperature,
+        trafoCoreTemperature: telemetry.trafoCoreTemperature,
+        igbtTemperature: telemetry.igbtTemperature,
+        heatSyncTemperature: telemetry.heatSyncTemperature,
+        machineOn: telemetry.machineOn,
+        arcOn: telemetry.arcOn,
+        gpsFix: telemetry.gpsFix,
+        gpsLat: telemetry.gpsLat,
+        gpsLng: telemetry.gpsLng,
+        mapUrl: telemetry.mapUrl,
+      },
+    })
+  );
 
   console.log("[mqtt] telemetry row created", {
     telemetryId: savedTelemetry.id,
@@ -554,10 +577,17 @@ async function persistTelemetry(telemetry) {
     elapsedMs: Date.now() - startedAt,
   });
 
-  await updateActiveWelderSessionFromTelemetry(savedTelemetry);
-  await processMqttTelemetryForWelderArcEvents(savedTelemetry);
+  await measureMqttOperation("welderSession.updateFromTelemetry", () =>
+    updateActiveWelderSessionFromTelemetry(savedTelemetry)
+  );
+  await measureMqttOperation("welderArcEvent.processTelemetry", () =>
+    processMqttTelemetryForWelderArcEvents(savedTelemetry)
+  );
 
-  const productionResult = await processTelemetryForProduction(savedTelemetry);
+  const productionResult = await measureMqttOperation(
+    "production.processTelemetry",
+    () => processTelemetryForProduction(savedTelemetry)
+  );
 
   console.log("[mqtt] production update completed", {
     telemetryId: savedTelemetry.id,
@@ -817,4 +847,8 @@ module.exports = {
   }),
   startTelemetryService,
   stopTelemetryService,
+  _test: {
+    normalizeTelemetryPayload,
+    parseMachineIdentifier,
+  },
 };

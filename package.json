@@ -4,6 +4,7 @@
   "description": "MEMCO IoT Platform Node.js Backend V1",
   "main": "src/server.js",
   "scripts": {
+    "test": "node --test",
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "db:migrate": "npx prisma migrate deploy",

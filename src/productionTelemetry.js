@@ -10,6 +10,20 @@ const PRODUCTION_STATES = {
 const OFFLINE_AFTER_SECONDS = 5 * 60;
 const MS_PER_SECOND = 1000;
 const MS_PER_DAY = 24 * 60 * 60 * MS_PER_SECOND;
+const SLOW_QUERY_MS = 250;
+const machineProcessingQueues = new Map();
+
+async function measureQuery(operation, query) {
+  const startedAt = Date.now();
+
+  try {
+    return await query();
+  } finally {
+    const elapsedMs = Date.now() - startedAt;
+    const log = elapsedMs >= SLOW_QUERY_MS ? console.warn : console.log;
+    log("[production] Prisma operation completed", { operation, elapsedMs });
+  }
+}
 
 function toDate(value) {
   const date = value instanceof Date ? value : new Date(value);
@@ -106,26 +120,28 @@ function buildDurationIncrements(state, seconds) {
 }
 
 async function incrementDailySummary(tx, machineId, date, data) {
-  await tx.dailyProductionSummary.upsert({
-    where: {
-      machineId_date: {
+  await measureQuery("dailyProductionSummary.upsert", () =>
+    tx.dailyProductionSummary.upsert({
+      where: {
+        machineId_date: {
+          machineId,
+          date,
+        },
+      },
+      create: {
         machineId,
         date,
+        arcSeconds: data.arcSeconds?.increment || 0,
+        idleSeconds: data.idleSeconds?.increment || 0,
+        offSeconds: data.offSeconds?.increment || 0,
+        offlineSeconds: data.offlineSeconds?.increment || 0,
+        machineOnSeconds: data.machineOnSeconds?.increment || 0,
+        noOfArcs: data.noOfArcs?.increment || 0,
+        lastUpdatedAt: data.lastUpdatedAt || new Date(),
       },
-    },
-    create: {
-      machineId,
-      date,
-      arcSeconds: data.arcSeconds?.increment || 0,
-      idleSeconds: data.idleSeconds?.increment || 0,
-      offSeconds: data.offSeconds?.increment || 0,
-      offlineSeconds: data.offlineSeconds?.increment || 0,
-      machineOnSeconds: data.machineOnSeconds?.increment || 0,
-      noOfArcs: data.noOfArcs?.increment || 0,
-      lastUpdatedAt: data.lastUpdatedAt || new Date(),
-    },
-    update: data,
-  }, { timeout: 15000, maxWait: 10000 });
+      update: data,
+    })
+  );
 }
 
 async function addDurationToDailySummaries(tx, machineId, state, startTime, endTime) {
@@ -233,7 +249,24 @@ function buildLatestTelemetryData(telemetry, state) {
   };
 }
 
-async function processTelemetryForProduction(telemetry) {
+async function applyProductionSummaryEffects(machineId, effects) {
+  for (const effect of effects) {
+    if (effect.type === "duration") {
+      await addDurationToDailySummaries(
+        prisma,
+        machineId,
+        effect.state,
+        effect.startTime,
+        effect.endTime
+      );
+    } else if (effect.type === "arcCount") {
+      await incrementArcCount(prisma, machineId, effect.startTime);
+    }
+  }
+}
+
+async function processTelemetryForProductionNow(telemetry) {
+  const startedAt = Date.now();
   const telemetryTime = toDate(telemetry?.timestamp || telemetry?.createdAt);
 
   if (!telemetry?.machineId || !telemetryTime) {
@@ -241,116 +274,199 @@ async function processTelemetryForProduction(telemetry) {
   }
 
   const state = deriveMachineProductionState(telemetry);
-
-  return prisma.$transaction(async (tx) => {
-    const latest = await tx.machineLatestTelemetry.findUnique({
+  const latest = await measureQuery("machineLatestTelemetry.findUnique", () =>
+    prisma.machineLatestTelemetry.findUnique({
       where: { machineId: telemetry.machineId },
-    });
+    })
+  );
 
-    const isOlderThanLatest = latest && telemetryTime < latest.timestamp;
+  const isOlderThanLatest = latest && telemetryTime < latest.timestamp;
 
-    if (!isOlderThanLatest) {
-      await tx.machineLatestTelemetry.upsert({
-        where: { machineId: telemetry.machineId },
-        create: buildLatestTelemetryData({ ...telemetry, timestamp: telemetryTime }, state),
-        update: buildLatestTelemetryData({ ...telemetry, timestamp: telemetryTime }, state),
-      });
-    }
+  if (isOlderThanLatest) {
+    return {
+      state,
+      skippedHistory: true,
+      reason: "Telemetry timestamp is older than the latest processed sample",
+    };
+  }
 
-    if (isOlderThanLatest) {
-      return {
-        state,
-        skippedHistory: true,
-        reason: "Telemetry timestamp is older than the latest processed sample",
-      };
-    }
-
-    const openEvent = await tx.machineProductionEvent.findFirst({
-      where: {
-        machineId: telemetry.machineId,
-        endTime: null,
-      },
-      orderBy: [{ startTime: "desc" }, { id: "desc" }],
-    });
-
-    if (!openEvent) {
-      const previousEvent = await tx.machineProductionEvent.findFirst({
-        where: { machineId: telemetry.machineId },
-        orderBy: [{ startTime: "desc" }, { id: "desc" }],
-      });
-
-      await createEvent(
-        tx,
-        telemetry.machineId,
-        state,
-        telemetryTime,
-        previousEvent?.state
+  const transactionResult = await measureQuery(
+    "machineProductionEvent.transaction",
+    () => prisma.$transaction(async (tx) => {
+      const summaryEffects = [];
+      const openEvent = await measureQuery("machineProductionEvent.findOpen", () =>
+        tx.machineProductionEvent.findFirst({
+          where: {
+            machineId: telemetry.machineId,
+            endTime: null,
+          },
+          orderBy: [{ startTime: "desc" }, { id: "desc" }],
+        })
       );
 
-      return { state, eventChanged: true };
-    }
+      if (!openEvent) {
+        const previousEvent = await measureQuery("machineProductionEvent.findPrevious", () =>
+          tx.machineProductionEvent.findFirst({
+            where: { machineId: telemetry.machineId },
+            orderBy: [{ startTime: "desc" }, { id: "desc" }],
+          })
+        );
 
-    if (telemetryTime <= openEvent.startTime) {
-      return {
-        state,
-        eventChanged: false,
-        reason: "Telemetry timestamp is not newer than current event start",
-      };
-    }
+        await measureQuery("machineProductionEvent.create", () =>
+          tx.machineProductionEvent.create({
+            data: { machineId: telemetry.machineId, state, startTime: telemetryTime },
+          })
+        );
 
-    const previousTelemetryTime = latest?.timestamp ? toDate(latest.timestamp) : null;
-    const offlineStart =
-      previousTelemetryTime &&
-      telemetryTime.getTime() - previousTelemetryTime.getTime() >
-        OFFLINE_AFTER_SECONDS * MS_PER_SECOND
-        ? new Date(
-            previousTelemetryTime.getTime() +
-              OFFLINE_AFTER_SECONDS * MS_PER_SECOND
-          )
-        : null;
+        if (state === PRODUCTION_STATES.ARC && previousEvent?.state !== state) {
+          summaryEffects.push({ type: "arcCount", startTime: telemetryTime });
+        }
 
-    if (offlineStart && offlineStart > openEvent.startTime) {
-      await closeEvent(tx, openEvent, offlineStart);
+        return { result: { state, eventChanged: true }, summaryEffects };
+      }
 
-      if (telemetryTime > offlineStart) {
-        const offlineEvent = await tx.machineProductionEvent.create({
-          data: {
-            machineId: telemetry.machineId,
+      if (telemetryTime <= openEvent.startTime) {
+        return {
+          result: {
+            state,
+            eventChanged: false,
+            reason: "Telemetry timestamp is not newer than current event start",
+          },
+          summaryEffects,
+        };
+      }
+
+      const previousTelemetryTime = latest?.timestamp ? toDate(latest.timestamp) : null;
+      const offlineStart =
+        previousTelemetryTime &&
+        telemetryTime.getTime() - previousTelemetryTime.getTime() >
+          OFFLINE_AFTER_SECONDS * MS_PER_SECOND
+          ? new Date(
+              previousTelemetryTime.getTime() +
+                OFFLINE_AFTER_SECONDS * MS_PER_SECOND
+            )
+          : null;
+
+      if (offlineStart && offlineStart > openEvent.startTime) {
+        await measureQuery("machineProductionEvent.closeForOfflineGap", () =>
+          tx.machineProductionEvent.update({
+            where: { id: openEvent.id },
+            data: {
+              endTime: offlineStart,
+              durationSeconds: getDurationSeconds(openEvent.startTime, offlineStart),
+            },
+          })
+        );
+        summaryEffects.push({
+          type: "duration",
+          state: openEvent.state,
+          startTime: openEvent.startTime,
+          endTime: offlineStart,
+        });
+
+        if (telemetryTime > offlineStart) {
+          await measureQuery("machineProductionEvent.createOfflineGap", () =>
+            tx.machineProductionEvent.create({
+              data: {
+                machineId: telemetry.machineId,
+                state: PRODUCTION_STATES.OFFLINE,
+                startTime: offlineStart,
+                endTime: telemetryTime,
+                durationSeconds: getDurationSeconds(offlineStart, telemetryTime),
+              },
+            })
+          );
+          summaryEffects.push({
+            type: "duration",
             state: PRODUCTION_STATES.OFFLINE,
             startTime: offlineStart,
             endTime: telemetryTime,
-            durationSeconds: getDurationSeconds(offlineStart, telemetryTime),
-          },
-        });
+          });
+        }
 
-        await addDurationToDailySummaries(
-          tx,
-          telemetry.machineId,
-          offlineEvent.state,
-          offlineEvent.startTime,
-          telemetryTime
+        await measureQuery("machineProductionEvent.createAfterOfflineGap", () =>
+          tx.machineProductionEvent.create({
+            data: { machineId: telemetry.machineId, state, startTime: telemetryTime },
+          })
         );
+        if (state === PRODUCTION_STATES.ARC) {
+          summaryEffects.push({ type: "arcCount", startTime: telemetryTime });
+        }
+
+        return {
+          result: { state, eventChanged: true, offlineGapRecorded: true },
+          summaryEffects,
+        };
       }
 
-      await createEvent(
-        tx,
-        telemetry.machineId,
-        state,
-        telemetryTime,
-        PRODUCTION_STATES.OFFLINE
+      if (openEvent.state === state) {
+        return { result: { state, eventChanged: false }, summaryEffects };
+      }
+
+      await measureQuery("machineProductionEvent.closeForStateChange", () =>
+        tx.machineProductionEvent.update({
+          where: { id: openEvent.id },
+          data: {
+            endTime: telemetryTime,
+            durationSeconds: getDurationSeconds(openEvent.startTime, telemetryTime),
+          },
+        })
       );
+      summaryEffects.push({
+        type: "duration",
+        state: openEvent.state,
+        startTime: openEvent.startTime,
+        endTime: telemetryTime,
+      });
 
-      return { state, eventChanged: true, offlineGapRecorded: true };
+      await measureQuery("machineProductionEvent.createForStateChange", () =>
+        tx.machineProductionEvent.create({
+          data: { machineId: telemetry.machineId, state, startTime: telemetryTime },
+        })
+      );
+      if (state === PRODUCTION_STATES.ARC) {
+        summaryEffects.push({ type: "arcCount", startTime: telemetryTime });
+      }
+
+      return { result: { state, eventChanged: true }, summaryEffects };
+    })
+  );
+
+  await measureQuery("machineLatestTelemetry.upsert", () =>
+    prisma.machineLatestTelemetry.upsert({
+      where: { machineId: telemetry.machineId },
+      create: buildLatestTelemetryData({ ...telemetry, timestamp: telemetryTime }, state),
+      update: buildLatestTelemetryData({ ...telemetry, timestamp: telemetryTime }, state),
+    })
+  );
+
+  await applyProductionSummaryEffects(
+    telemetry.machineId,
+    transactionResult.summaryEffects
+  );
+
+  console.log("[production] telemetry processing completed", {
+    machineId: telemetry.machineId,
+    telemetryId: telemetry.id,
+    elapsedMs: Date.now() - startedAt,
+  });
+
+  return transactionResult.result;
+}
+
+function processTelemetryForProduction(telemetry) {
+  const machineId = telemetry?.machineId;
+  const previous = machineProcessingQueues.get(machineId) || Promise.resolve();
+  const queued = previous
+    .catch(() => undefined)
+    .then(() => processTelemetryForProductionNow(telemetry));
+
+  machineProcessingQueues.set(machineId, queued);
+
+  return queued.finally(() => {
+    if (machineProcessingQueues.get(machineId) === queued) {
+      machineProcessingQueues.delete(machineId);
     }
-
-    if (openEvent.state === state) {
-      return { state, eventChanged: false };
-    }
-
-    await closeEvent(tx, openEvent, telemetryTime);
-    await createEvent(tx, telemetry.machineId, state, telemetryTime, openEvent.state);
-
-    return { state, eventChanged: true };
   });
 }
 

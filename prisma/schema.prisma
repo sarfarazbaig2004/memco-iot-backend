@@ -44,6 +44,8 @@ model Machine {
   userAccesses             UserMachineAccess[]
   welderArcEvents          WelderArcEvent[]
   welderSessions           WelderSession[]
+
+  @@index([machineCode])
 }
 
 model Telemetry {
@@ -127,7 +129,7 @@ model MachineProductionEvent {
 
   @@index([machineId, startTime])
   @@index([machineId, state])
-  @@index([machineId, endTime])
+  @@index([machineId, endTime, startTime])
 }
 
 model DailyProductionSummary {
