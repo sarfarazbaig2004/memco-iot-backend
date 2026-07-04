@@ -60,6 +60,17 @@ function parseNumber(value) {
   return Number.isFinite(parsedValue) ? parsedValue : null;
 }
 
+function parseHeartbeat(value) {
+  if (value === undefined || value === null || value === "") return null;
+
+  const heartbeat = Number(value);
+  if (!Number.isInteger(heartbeat) || heartbeat < 0 || heartbeat > 10) {
+    throw new Error("hbt must be an integer from 0 to 10");
+  }
+
+  return heartbeat;
+}
+
 function parseBoolean(value) {
   if (typeof value === "boolean") return value;
   if (value === "true") return true;
@@ -199,6 +210,7 @@ function summarizeTelemetry(telemetry) {
 
   return {
     machineIdentifier: telemetry.machineIdentifier,
+    heartbeat: telemetry.heartbeat,
     isGpsOnly: telemetry.isGpsOnly,
     timestamp: telemetry.timestamp?.toISOString?.() || telemetry.timestamp,
     inputVoltage: telemetry.inputVoltage,
@@ -321,6 +333,7 @@ function normalizeTelemetryPayload(payload, topic) {
   }
 
   const normalizedPayload = { ...payload };
+  const heartbeat = parseHeartbeat(normalizedPayload.hbt);
 
   if (Array.isArray(normalizedPayload.readings)) {
     const readings = normalizedPayload.readings;
@@ -505,6 +518,7 @@ const weldingVoltage =
 
   return {
     machineIdentifier,
+    heartbeat,
     timestamp: parseTimestamp(parseDateTimePayload(normalizedPayload)),
     inputVoltage,
     outputVoltage,
@@ -614,6 +628,7 @@ async function handleIncomingMessage(topic, message) {
       byteLength: message.length,
       payloadKeys: getPayloadKeys(payload),
       machineIdentifier: parseMachineIdentifier(payload, topic),
+      heartbeat: payload?.hbt,
     });
   } catch (error) {
     console.warn("[mqtt] ignoring non-JSON payload", {
@@ -849,6 +864,7 @@ module.exports = {
   stopTelemetryService,
   _test: {
     normalizeTelemetryPayload,
+    parseHeartbeat,
     parseMachineIdentifier,
   },
 };
