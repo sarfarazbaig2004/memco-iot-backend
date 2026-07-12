@@ -1,6 +1,17 @@
 node_modules
+__pycache__/
+*.py[cod]
 # Keep environment variables out of version control
 .env
+local_influx/.env
+local_influx/secrets/influxdb3-admin-token.json
 
 /src/generated/prisma
 .DS_Store
+# Local InfluxDB
+local_influx/data/
+local_influx/__pycache__/
+local_influx/*.pyc
+
+# Local secrets
+local_influx/secrets/influxdb3-admin-token.json
