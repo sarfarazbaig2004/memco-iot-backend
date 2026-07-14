@@ -1,15 +1,14 @@
-const mqtt = require("mqtt");
-const prisma = require("./db");
 const config = require("./config");
-
 const {
-  processMqttTelemetryForWelderArcEvents,
-  updateActiveWelderSessionFromTelemetry,
-  recoverOpenArcStates,
-} = require("./welderSessions");
+  getSimulatorStatus,
+  startVirtualMemcoSimulator,
+  stopVirtualMemcoSimulator,
+} = require("./virtualMemcoSimulator");
 
-const { processTelemetryForProduction } = require("./productionTelemetry");
-
+let mqtt = null;
+let prisma = null;
+let welderSessions = null;
+let productionTelemetry = null;
 let client = null;
 let demoTelemetryInterval = null;
 let isStarted = false;
@@ -20,6 +19,34 @@ const mqttState = {
   subscribedTopic: null,
   lastError: null,
 };
+
+function getMqtt() {
+  if (!mqtt) {
+    mqtt = require("mqtt");
+  }
+  return mqtt;
+}
+
+function getPrisma() {
+  if (!prisma) {
+    prisma = require("./db");
+  }
+  return prisma;
+}
+
+function getWelderSessions() {
+  if (!welderSessions) {
+    welderSessions = require("./welderSessions");
+  }
+  return welderSessions;
+}
+
+function getProductionTelemetry() {
+  if (!productionTelemetry) {
+    productionTelemetry = require("./productionTelemetry");
+  }
+  return productionTelemetry;
+}
 
 function getErrorDetails(error) {
   return {
@@ -205,6 +232,24 @@ function hasWeldingPayload(payload) {
   ]);
 }
 
+function deriveMachineOnFromTelemetry(payload, inputVoltage, outputVoltage, outputCurrent) {
+  const electricalValues = [
+    inputVoltage,
+    parseNumber(payload.inputVoltageR),
+    parseNumber(payload.inputVoltageY),
+    parseNumber(payload.inputVoltageB),
+    outputVoltage,
+    outputCurrent,
+    parseNumber(payload.fanPulsePerMin),
+  ].filter((value) => value !== null);
+
+  if (electricalValues.length && electricalValues.every((value) => value === 0)) {
+    return false;
+  }
+
+  return true;
+}
+
 function summarizeTelemetry(telemetry) {
   if (!telemetry) return null;
 
@@ -214,8 +259,13 @@ function summarizeTelemetry(telemetry) {
     isGpsOnly: telemetry.isGpsOnly,
     timestamp: telemetry.timestamp?.toISOString?.() || telemetry.timestamp,
     inputVoltage: telemetry.inputVoltage,
+    inputVoltageR: telemetry.inputVoltageR,
+    inputVoltageY: telemetry.inputVoltageY,
+    inputVoltageB: telemetry.inputVoltageB,
     outputVoltage: telemetry.outputVoltage,
     outputCurrent: telemetry.outputCurrent,
+    currentSetting: telemetry.currentSetting,
+    fanPulsePerMin: telemetry.fanPulsePerMin,
     temperature: telemetry.temperature,
     trafoCoreTemperature: telemetry.trafoCoreTemperature,
     igbtTemperature: telemetry.igbtTemperature,
@@ -234,20 +284,21 @@ function summarizeTelemetry(telemetry) {
 async function ensureMachineExists(machineIdentifier) {
   const normalizedIdentifier = String(machineIdentifier || "").trim();
   if (!normalizedIdentifier) return null;
+  const prismaClient = getPrisma();
 
-  const existingMachine = await prisma.machine.findFirst({
+  const existingMachine = await prismaClient.machine.findFirst({
     where: { machineCode: normalizedIdentifier },
     select: { id: true, machineCode: true },
   });
 
   if (existingMachine) return existingMachine;
 
-  const defaultCompany = await prisma.company.findFirst({
+  const defaultCompany = await prismaClient.company.findFirst({
     orderBy: { id: "asc" },
     select: { id: true },
   });
 
-  const createdMachine = await prisma.machine.create({
+  const createdMachine = await prismaClient.machine.create({
     data: {
       companyId: defaultCompany?.id || 1,
       machineCode: normalizedIdentifier,
@@ -270,6 +321,7 @@ async function ensureMachineExists(machineIdentifier) {
 
 async function findMachineByIdentifier(machineIdentifier) {
   const normalizedIdentifier = String(machineIdentifier || "").trim();
+  const prismaClient = getPrisma();
   const numericMachineId = /^\d+$/.test(normalizedIdentifier)
     ? Number.parseInt(normalizedIdentifier, 10)
     : null;
@@ -280,7 +332,7 @@ async function findMachineByIdentifier(machineIdentifier) {
   });
 
   if (Number.isInteger(numericMachineId) && numericMachineId > 0) {
-    const machineById = await prisma.machine.findUnique({
+    const machineById = await prismaClient.machine.findUnique({
       where: { id: numericMachineId },
       select: { id: true, machineCode: true },
     });
@@ -295,7 +347,7 @@ async function findMachineByIdentifier(machineIdentifier) {
     }
   }
 
-  const machineByCode = await prisma.machine.findFirst({
+  const machineByCode = await prismaClient.machine.findFirst({
     where: { machineCode: normalizedIdentifier },
     select: { id: true, machineCode: true },
   });
@@ -390,9 +442,6 @@ function normalizeTelemetryPayload(payload, topic) {
         normalizedPayload.inputVoltageB || 0
       );
 
-    normalizedPayload.machineOn = true;
-    
-
     normalizedPayload.arcOn =
       normalizedPayload.arcOn ?? (normalizedPayload.outputCurrent || 0) > 15;
   }
@@ -477,7 +526,19 @@ const weldingVoltage =
         : false
       : parseBoolean(normalizedPayload.arcOn);
 
-  const machineOn = true;
+  const parsedMachineOn = parseOptionalBoolean(normalizedPayload.machineOn);
+  const hasMachineOnValue =
+    normalizedPayload.machineOn !== undefined &&
+    normalizedPayload.machineOn !== null &&
+    normalizedPayload.machineOn !== "";
+  const machineOn = hasMachineOnValue
+    ? parsedMachineOn
+    : deriveMachineOnFromTelemetry(
+        normalizedPayload,
+        inputVoltage,
+        outputVoltage,
+        outputCurrent
+      );
 
   const containsWeldingData = hasWeldingPayload(normalizedPayload);
   const containsGpsData = hasGpsPayload(normalizedPayload);
@@ -488,10 +549,8 @@ const weldingVoltage =
   }
 
   if (
-    normalizedPayload.machineOn !== undefined &&
-    normalizedPayload.machineOn !== null &&
-    normalizedPayload.machineOn !== "" &&
-    machineOn === null
+    hasMachineOnValue &&
+    parsedMachineOn === null
   ) {
     throw new Error('machineOn must be a boolean or "true"/"false" string');
   }
@@ -521,8 +580,13 @@ const weldingVoltage =
     heartbeat,
     timestamp: parseTimestamp(parseDateTimePayload(normalizedPayload)),
     inputVoltage,
+    inputVoltageR: parseNumber(normalizedPayload.inputVoltageR),
+    inputVoltageY: parseNumber(normalizedPayload.inputVoltageY),
+    inputVoltageB: parseNumber(normalizedPayload.inputVoltageB),
     outputVoltage,
     outputCurrent,
+    currentSetting: parseNumber(normalizedPayload.currentSetting),
+    fanPulsePerMin: parseNumber(normalizedPayload.fanPulsePerMin),
     weldingCurrent,
     weldingVoltage,
     temperature,
@@ -543,6 +607,12 @@ const weldingVoltage =
 
 async function persistTelemetry(telemetry) {
   const startedAt = Date.now();
+  const prismaClient = getPrisma();
+  const {
+    processMqttTelemetryForWelderArcEvents,
+    updateActiveWelderSessionFromTelemetry,
+  } = getWelderSessions();
+  const { processTelemetryForProduction } = getProductionTelemetry();
 
   console.log("[mqtt] telemetry persistence started", summarizeTelemetry(telemetry));
 
@@ -557,13 +627,18 @@ async function persistTelemetry(telemetry) {
   console.log(`[mqtt] machine resolved ${telemetry.machineIdentifier} -> id ${machine.id}`);
 
   const savedTelemetry = await measureMqttOperation("telemetry.create", () =>
-    prisma.telemetry.create({
+    prismaClient.telemetry.create({
       data: {
         machineId: machine.id,
         timestamp: telemetry.timestamp,
         inputVoltage: telemetry.inputVoltage,
+        inputVoltageR: telemetry.inputVoltageR,
+        inputVoltageY: telemetry.inputVoltageY,
+        inputVoltageB: telemetry.inputVoltageB,
         outputVoltage: telemetry.outputVoltage,
         outputCurrent: telemetry.outputCurrent,
+        currentSetting: telemetry.currentSetting,
+        fanPulsePerMin: telemetry.fanPulsePerMin,
         temperature: telemetry.temperature,
         trafoCoreTemperature: telemetry.trafoCoreTemperature,
         igbtTemperature: telemetry.igbtTemperature,
@@ -574,6 +649,12 @@ async function persistTelemetry(telemetry) {
         gpsLat: telemetry.gpsLat,
         gpsLng: telemetry.gpsLng,
         mapUrl: telemetry.mapUrl,
+        ...(telemetry.runningJob !== undefined && telemetry.runningJob !== null
+          ? { runningJob: telemetry.runningJob }
+          : {}),
+        ...(telemetry.machineLifetime !== undefined && telemetry.machineLifetime !== null
+          ? { machineLifetime: telemetry.machineLifetime }
+          : {}),
       },
     })
   );
@@ -679,7 +760,8 @@ async function handleIncomingMessage(topic, message) {
 }
 
 async function generateFleetTelemetry() {
-  const machines = await prisma.machine.findMany({
+  const prismaClient = getPrisma();
+  const machines = await prismaClient.machine.findMany({
     select: { id: true },
     orderBy: { id: "asc" },
   });
@@ -709,7 +791,7 @@ async function generateFleetTelemetry() {
     };
   });
 
-  await prisma.telemetry.createMany({
+  await prismaClient.telemetry.createMany({
     data: rows,
   });
 
@@ -747,7 +829,7 @@ function startMqttSubscription() {
     return;
   }
 
-  client = mqtt.connect(config.mqttBrokerUrl, {
+  client = getMqtt().connect(config.mqttBrokerUrl, {
     clientId: config.mqttClientId,
     connectTimeout: config.mqttConnectTimeoutMs,
     reconnectPeriod: config.mqttReconnectPeriodMs,
@@ -815,7 +897,7 @@ async function startTelemetryService() {
   isStarted = true;
 
   try {
-    await recoverOpenArcStates();
+    await getWelderSessions().recoverOpenArcStates();
   } catch (error) {
     console.error("[mqtt] failed to recover open arc state:", error);
   }
@@ -828,9 +910,12 @@ async function startTelemetryService() {
   }
 
   startDemoTelemetry();
+  startVirtualMemcoSimulator();
 }
 
 async function stopTelemetryService() {
+  await stopVirtualMemcoSimulator();
+
   if (demoTelemetryInterval) {
     clearInterval(demoTelemetryInterval);
     demoTelemetryInterval = null;
@@ -859,6 +944,7 @@ module.exports = {
     topic: config.mqttTopic,
     clientId: config.mqttClientId,
     url: config.mqttBrokerUrl,
+    simulator: getSimulatorStatus(),
   }),
   startTelemetryService,
   stopTelemetryService,

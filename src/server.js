@@ -41,6 +41,7 @@ app.get(["/", "/health"], (req, res) => {
       connected: telemetryStatus.connected,
       subscribedTopic: telemetryStatus.subscribedTopic,
     },
+    simulator: telemetryStatus.simulator,
     uptimeSeconds: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
   });

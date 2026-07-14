@@ -90,6 +90,21 @@ function parseOrigins(value) {
     .filter(Boolean);
 }
 
+function parseListEnv(name, defaultValue) {
+  const rawValue = process.env[name];
+
+  if (rawValue === undefined || rawValue === "") {
+    return defaultValue;
+  }
+
+  const values = rawValue
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  return values.length ? values : defaultValue;
+}
+
 module.exports = Object.freeze({
   nodeEnv: defaultNodeEnv,
   host: process.env.HOST || "0.0.0.0",
@@ -121,6 +136,27 @@ module.exports = Object.freeze({
   }),
   mqttUsername: process.env.MQTT_USERNAME || null,
   mqttPassword: process.env.MQTT_PASSWORD || null,
+  enableVirtualMemcoSimulator: parseBooleanEnv(
+    "ENABLE_VIRTUAL_MEMCO_SIMULATOR",
+    false
+  ),
+  virtualMemcoMachineCodes: parseListEnv("VIRTUAL_MEMCO_MACHINE_CODES", [
+    "WM-001",
+    "WM-002",
+    "WM-003",
+  ]),
+  virtualMemcoIntervalMs: parseIntegerEnv("VIRTUAL_MEMCO_INTERVAL_MS", 5000, {
+    min: 1000,
+  }),
+  virtualMemcoPublishQos: parseIntegerEnv("VIRTUAL_MEMCO_PUBLISH_QOS", 1, {
+    min: 0,
+    max: 2,
+  }),
+  virtualMemcoClientId:
+    process.env.VIRTUAL_MEMCO_CLIENT_ID ||
+    `memco-virtual-machine-${os.hostname()}-${process.pid}`,
+  virtualMemcoScenario: process.env.VIRTUAL_MEMCO_SCENARIO || "mixed",
+  virtualMemcoFaultScenario: process.env.VIRTUAL_MEMCO_FAULT_SCENARIO || "none",
   enableDemoTelemetry: parseBooleanEnv("ENABLE_DEMO_TELEMETRY", false),
   demoTelemetryIntervalMs: parseIntegerEnv("DEMO_TELEMETRY_INTERVAL_MS", 120000, {
     min: 1000,
